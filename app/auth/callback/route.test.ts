@@ -3,6 +3,7 @@ import { NextRequest } from "next/server";
 import { GET } from "./route";
 import { createClient } from "@/lib/supabase/server";
 import { decryptRefreshToken, encryptRefreshToken } from "@/lib/security/token-encryption";
+import { ensureCalendarWatch } from "@/lib/google/calendar-sync";
 
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
 vi.mock("@/lib/security/server-secrets", () => ({
@@ -11,6 +12,19 @@ vi.mock("@/lib/security/server-secrets", () => ({
 vi.mock("@/lib/auth/app-origin", () => ({
   getAppOrigin: () => "https://crestix-ai.vercel.app",
 }));
+vi.mock("@/lib/google/calendar-sync", () => ({
+  ensureCalendarWatch: vi.fn().mockResolvedValue({ watchId: "watch-1", renewed: true }),
+  safeCalendarErrorCode: () => "mocked_error",
+}));
+vi.mock("next/server", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("next/server")>();
+  return {
+    ...actual,
+    after: (task: () => unknown) => {
+      void task();
+    },
+  };
+});
 
 const key = btoa(String.fromCharCode(...new Uint8Array(32).fill(7)));
 const userId = "00000000-0000-0000-0000-000000000001";
@@ -28,7 +42,9 @@ function setup(refreshToken: string | null, existing: { encrypted_refresh_token:
     error: null,
   });
   const profileUpsert = vi.fn().mockResolvedValue({ error: null });
-  const connectionUpsert = vi.fn().mockResolvedValue({ error: null });
+  const connectionSingle = vi.fn().mockResolvedValue({ data: { id: "connection-1" }, error: null });
+  const connectionSelect = vi.fn().mockReturnValue({ single: connectionSingle });
+  const connectionUpsert = vi.fn().mockReturnValue({ select: connectionSelect });
   const lookup = vi.fn().mockResolvedValue({ data: existing, error: null });
   const eq = vi.fn().mockReturnValue({ maybeSingle: lookup });
   const select = vi.fn().mockReturnValue({ eq });
@@ -41,7 +57,7 @@ function setup(refreshToken: string | null, existing: { encrypted_refresh_token:
       ? { upsert: profileUpsert }
       : { select, upsert: connectionUpsert },
   } as never);
-  return { signOut, exchangeCodeForSession, profileUpsert, connectionUpsert, lookup, eq, select };
+  return { signOut, exchangeCodeForSession, profileUpsert, connectionUpsert, connectionSelect, connectionSingle, lookup, eq, select };
 }
 
 describe("OAuth callback refresh-token persistence", () => {
@@ -72,6 +88,11 @@ describe("OAuth callback refresh-token persistence", () => {
     expect(console.info).toHaveBeenCalledWith("oauth_calendar_connection_ready", {
       used_new_provider_refresh_token: false,
     });
+    expect(ensureCalendarWatch).toHaveBeenCalledWith(
+      "connection-1",
+      "https://crestix-ai.vercel.app",
+      expect.objectContaining({ accessToken: undefined }),
+    );
   });
 
   it("encrypts a new opaque provider token without looking up an old one", async () => {
@@ -114,7 +135,7 @@ describe("OAuth callback refresh-token persistence", () => {
 
   it("logs only the database error code when connection upsert fails", async () => {
     const db = setup("opaque-new-token", null);
-    db.connectionUpsert.mockResolvedValue({ error: { code: "42501", message: "sensitive detail" } });
+    db.connectionSingle.mockResolvedValue({ data: null, error: { code: "42501", message: "sensitive detail" } });
     const response = await GET(request());
     expect(response.headers.get("location")).toContain("error=calendar_connection_failed");
     expect(console.error).toHaveBeenCalledWith("oauth_calendar_connection_failed", {

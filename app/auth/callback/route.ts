@@ -1,4 +1,4 @@
-import { NextResponse, type NextRequest } from "next/server";
+import { after, NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import {
@@ -8,6 +8,7 @@ import {
 } from "@/lib/security/token-encryption";
 import { getTokenEncryptionKey } from "@/lib/security/server-secrets";
 import { getAppOrigin } from "@/lib/auth/app-origin";
+import { ensureCalendarWatch, safeCalendarErrorCode } from "@/lib/google/calendar-sync";
 
 const callbackSchema = z.object({ code: z.string().min(1) });
 
@@ -67,12 +68,13 @@ export async function GET(request: NextRequest) {
   const refreshToken = data.session.provider_refresh_token;
   let encryptionKey: string;
   try {
-    encryptionKey = await getTokenEncryptionKey();
+    encryptionKey = getTokenEncryptionKey();
   } catch {
     console.error("oauth_callback_unexpected_failure", { stage: "get_token_encryption_key" });
     await supabase.auth.signOut();
     return new Response("OAuth token storage unavailable", { status: 503 });
   }
+
   console.info("oauth_key_format", { key_format: describeBase64Input(encryptionKey) });
   const keyVersion = Number(process.env.TOKEN_KEY_VERSION ?? "1");
   const keyVersionValid = Number.isSafeInteger(keyVersion) && keyVersion > 0;
@@ -82,6 +84,7 @@ export async function GET(request: NextRequest) {
     has_provider_refresh_token: Boolean(refreshToken),
     key_version_valid: keyVersionValid,
   });
+
   if (!email || !keyVersionValid) {
     logCalendarFailure("invalid_prerequisites");
     await supabase.auth.signOut();
@@ -90,6 +93,7 @@ export async function GET(request: NextRequest) {
 
   let encryptedRefreshToken: string;
   let storedKeyVersion = keyVersion;
+
   if (refreshToken) {
     try {
       encryptedRefreshToken = await encryptRefreshToken(refreshToken, encryptionKey, user.id);
@@ -99,26 +103,18 @@ export async function GET(request: NextRequest) {
       return NextResponse.redirect(appUrl("/login?error=calendar_connection_failed"));
     }
   } else {
-    let existing: { encrypted_refresh_token: string; token_key_version: number } | null;
-    let lookupError: { code?: string } | null;
-    try {
-      const result = await supabase
-        .from("google_connections")
-        .select("encrypted_refresh_token, token_key_version")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      existing = result.data;
-      lookupError = result.error;
-    } catch {
-      logCalendarFailure("google_connection_lookup_exception");
-      await supabase.auth.signOut();
-      return NextResponse.redirect(appUrl("/login?error=calendar_connection_failed"));
-    }
+    const { data: existing, error: lookupError } = await supabase
+      .from("google_connections")
+      .select("encrypted_refresh_token,token_key_version")
+      .eq("user_id", user.id)
+      .maybeSingle();
+
     if (lookupError || !existing?.encrypted_refresh_token) {
       logCalendarFailure(lookupError ? "google_connection_lookup" : "google_connection_missing");
       await supabase.auth.signOut();
       return NextResponse.redirect(appUrl("/login?error=calendar_connection_failed"));
     }
+
     try {
       await decryptRefreshToken(existing.encrypted_refresh_token, encryptionKey, user.id);
     } catch {
@@ -126,6 +122,7 @@ export async function GET(request: NextRequest) {
       await supabase.auth.signOut();
       return NextResponse.redirect(appUrl("/login?error=calendar_connection_failed"));
     }
+
     encryptedRefreshToken = existing.encrypted_refresh_token;
     storedKeyVersion = existing.token_key_version;
     console.info("oauth_refresh_token_reused", {
@@ -133,27 +130,34 @@ export async function GET(request: NextRequest) {
       stored_key_version: storedKeyVersion,
     });
   }
+
   const { error: profileError } = await supabase.from("profiles").upsert({
     id: user.id,
     email,
     display_name: typeof user.user_metadata?.full_name === "string" ? user.user_metadata.full_name : null,
   });
+
   if (profileError) {
     console.error("oauth_profile_upsert_failed", { db_error_code: profileError.code });
     return NextResponse.redirect(appUrl("/login?error=profile_failed"));
   }
 
-  const { error: connectionError } = await supabase.from("google_connections").upsert({
-    user_id: user.id,
-    google_email: email,
-    encrypted_refresh_token: encryptedRefreshToken,
-    token_key_version: storedKeyVersion,
-    is_active: true,
-  }, { onConflict: "user_id" });
-  if (connectionError) {
+  const { data: connection, error: connectionError } = await supabase
+    .from("google_connections")
+    .upsert({
+      user_id: user.id,
+      google_email: email,
+      encrypted_refresh_token: encryptedRefreshToken,
+      token_key_version: storedKeyVersion,
+      is_active: true,
+    }, { onConflict: "user_id" })
+    .select("id")
+    .single();
+
+  if (connectionError || !connection) {
     console.error("oauth_calendar_connection_failed", {
       stage: "google_connection_upsert",
-      db_error_code: connectionError.code,
+      db_error_code: connectionError?.code ?? "missing_row",
     });
     return NextResponse.redirect(appUrl("/login?error=calendar_connection_failed"));
   }
@@ -161,5 +165,21 @@ export async function GET(request: NextRequest) {
   console.info("oauth_calendar_connection_ready", {
     used_new_provider_refresh_token: Boolean(refreshToken),
   });
+
+  const providerAccessToken = data.session.provider_token;
+  after(async () => {
+    try {
+      await ensureCalendarWatch(connection.id, appOrigin, {
+        accessToken: providerAccessToken ?? undefined,
+      });
+      console.info("calendar_oauth_bootstrap_ready", { connection_id: connection.id });
+    } catch (bootstrapError) {
+      console.error("calendar_oauth_bootstrap_failed", {
+        connection_id: connection.id,
+        code: safeCalendarErrorCode(bootstrapError),
+      });
+    }
+  });
+
   return NextResponse.redirect(appUrl("/fs/meetings"));
 }

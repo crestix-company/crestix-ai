@@ -1,17 +1,18 @@
 # CRESTIX AI OS / FS Sales AI
 
-Internal TEST MVP for FS sales preparation and, in a later phase, real-time meeting assistance.
+Internal TEST MVP for FS sales preparation and real-time meeting assistance.
 
 ## Phase status
 
-- Phase 0: Vercel migration in progress; Preview OAuth and browser authorization smoke tests remain
-- Phase 1–5: not implemented
+- Phase 0: GO with accepted residual risk for short-lived PKCE authorization code visibility in Vercel-managed request metadata
+- Phase 1: source implementation prepared; remote Supabase schema applied; Vercel deployment and production Calendar acceptance smoke pending
+- Phase 2–5: not complete
 
-See `docs/gap-analysis.md`, `docs/open-questions.md`, and `docs/adr/0003-vercel-phase-0.md` before changing architecture or sales behavior.
+See `docs/phase-1-report.md`, `docs/calendar-detection.md`, `docs/gap-analysis.md`, and `docs/adr/0003-vercel-phase-0.md`.
 
 ## Requirements
 
-- Node.js 24
+- Node.js 22
 - npm
 - Docker-compatible runtime for local Supabase
 - Supabase CLI
@@ -24,7 +25,8 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Use only a publishable Supabase key in `NEXT_PUBLIC_SUPABASE_ANON_KEY`. Never expose a service-role or secret key to the browser. See `docs/vercel-deployment.md`.
+Only the Supabase URL and publishable key may be exposed with `NEXT_PUBLIC_`.
+Calendar refresh credentials, Supabase server key, cron secret, and token encryption key are server-only.
 
 ## Verification
 
@@ -33,7 +35,12 @@ npm run lint
 npm run typecheck
 npm test
 npm run build
-npm run preview
+```
+
+For local database policy tests:
+
+```bash
+supabase test db
 ```
 
 ## Bootstrap
@@ -42,4 +49,4 @@ Signup is disabled. Create the initial Auth user, profile, organization, and ADM
 
 ## Scope
 
-The product is not a Calendar UI, KPI tracker, or company-wide task manager. Calendar integration begins in Phase 1. `skills/fs/medical-fs-e1-complete/SKILL.md` is the only source of truth for FS E1 sales logic and must not be silently changed, summarized, or copied into competing Skills.
+The product is not a Calendar UI, KPI tracker, or company-wide task manager. Calendar is an input source for FS meetings. `skills/fs/medical-fs-e1-complete/SKILL.md` remains the only source of truth for FS E1 sales logic and must not be silently changed, summarized, or copied into competing Skills.
