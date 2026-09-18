@@ -24,3 +24,5 @@ work/
 
 # Supabase local CLI state
 supabase/.temp/
+.vercel
+.env*
