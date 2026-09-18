@@ -1,0 +1,2 @@
+-- Intentionally empty. Do not add real users or credentials.
+-- Bootstrap the first ADMIN through an audited, environment-specific operation.

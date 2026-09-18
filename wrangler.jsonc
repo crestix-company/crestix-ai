@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crestix-ai",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-09-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["TOKEN_ENCRYPTION_KEY"]
+  },
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "env": {
+    "staging": {
+      "name": "crestix-ai-staging",
+      "vars": {
+        "APP_ORIGIN": "https://crestix-ai-staging.survey-system.workers.dev"
+      },
+      "secrets": {
+        "required": ["TOKEN_ENCRYPTION_KEY"]
+      },
+      "assets": {
+        "directory": ".open-next/assets",
+        "binding": "ASSETS"
+      }
+    }
+  }
+}
