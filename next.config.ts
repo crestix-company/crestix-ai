@@ -16,6 +16,13 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
   },
+  // Skill files are read dynamically (fs.readFile) at request time, so
+  // Next.js's static import/require tracer never sees them and omits them
+  // from the deployed serverless bundle. Force-include them explicitly.
+  outputFileTracingIncludes: {
+    "/fs/meetings/\\[id\\]": ["skills/**/*"],
+    "/*": ["skills/**/*"],
+  },
   async headers() {
     return [{ source: "/(.*)", headers: securityHeaders }];
   },
