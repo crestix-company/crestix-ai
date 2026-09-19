@@ -7,7 +7,7 @@ function formatDateTime(value: string | null): string {
   }).format(new Date(value));
 }
 
-const JSON_SCHEMA_SKELETON = `{
+export const JSON_SCHEMA_SKELETON = `{
   "facts": [{ "statement": "...", "source_url": "https://..." }],
   "hypotheses": ["..."],
   "needs_confirmation": ["..."],

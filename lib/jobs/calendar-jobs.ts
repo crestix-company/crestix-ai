@@ -6,33 +6,25 @@ import {
   safeCalendarErrorCode,
   syncGoogleCalendarConnection,
 } from "@/lib/google/calendar-sync";
+import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
+
+export { enqueueCalendarSyncJob, enqueueMeetingPreparationJob } from "@/lib/jobs/queue";
 
 const MAX_ATTEMPTS = 5;
+const PREPARATION_JOB_TYPES = ["MEETING_PREPARATION"] as const;
+const CALENDAR_JOB_TYPES = ["CALENDAR_SYNC", "WATCH_RENEWAL"] as const;
 
-export async function enqueueCalendarSyncJob(input: {
-  connectionId: string;
-  dedupeKey: string;
-  payload?: Record<string, unknown>;
-}): Promise<string | null> {
+async function markPreparationFailed(meetingId: string): Promise<void> {
   const admin = createAdminClient();
-  const { data, error } = await admin
-    .from("jobs")
-    .upsert({
-      job_type: "CALENDAR_SYNC",
-      google_connection_id: input.connectionId,
-      payload: input.payload ?? {},
-      dedupe_key: input.dedupeKey,
-      status: "PENDING",
-      run_after: new Date().toISOString(),
-    }, {
-      onConflict: "dedupe_key",
-      ignoreDuplicates: true,
-    })
-    .select("id")
-    .maybeSingle();
-
-  if (error && error.code !== "23505") throw new Error("calendar_job_enqueue_failed");
-  return data?.id ?? null;
+  try {
+    await admin.from("meeting_preparations").update({ status: "FAILED" }).eq("meeting_id", meetingId);
+    await admin.from("meetings").update({ status: "FAILED" }).eq("id", meetingId).neq("status", "CANCELLED");
+  } catch (error) {
+    console.error("meeting_preparation_failure_flag_failed", {
+      meeting_id: meetingId,
+      code: safeCalendarErrorCode(error),
+    });
+  }
 }
 
 export async function processCalendarJob(
@@ -44,7 +36,7 @@ export async function processCalendarJob(
 
   const { data: pending, error: lookupError } = await admin
     .from("jobs")
-    .select("id,job_type,google_connection_id,status,attempts,run_after")
+    .select("id,job_type,google_connection_id,meeting_id,status,attempts,run_after")
     .eq("id", jobId)
     .maybeSingle();
 
@@ -68,14 +60,17 @@ export async function processCalendarJob(
   if (claimError || !claimed) return "skipped";
 
   try {
-    if (!pending.google_connection_id) throw new Error("calendar_job_connection_missing");
-
     if (pending.job_type === "CALENDAR_SYNC") {
+      if (!pending.google_connection_id) throw new Error("calendar_job_connection_missing");
       await syncGoogleCalendarConnection(pending.google_connection_id);
     } else if (pending.job_type === "WATCH_RENEWAL") {
+      if (!pending.google_connection_id) throw new Error("calendar_job_connection_missing");
       await ensureCalendarWatch(pending.google_connection_id, appOrigin, { force: true });
+    } else if (pending.job_type === "MEETING_PREPARATION") {
+      if (!pending.meeting_id) throw new Error("meeting_preparation_job_meeting_missing");
+      await runAutoPreparationForMeeting(pending.meeting_id);
     } else {
-      throw new Error("unsupported_phase1_job_type");
+      throw new Error("unsupported_job_type");
     }
 
     await admin
@@ -99,6 +94,11 @@ export async function processCalendarJob(
           last_error_safe: safeError,
         })
         .eq("id", jobId);
+
+      if (pending.job_type === "MEETING_PREPARATION" && pending.meeting_id) {
+        await markPreparationFailed(pending.meeting_id);
+      }
+
       return "failed";
     }
 
@@ -117,9 +117,10 @@ export async function processCalendarJob(
   }
 }
 
-export async function runDueCalendarJobs(
+async function runDueJobsOfTypes(
   appOrigin: string,
-  limit = 10,
+  jobTypes: readonly string[],
+  limit: number,
 ): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
   const admin = createAdminClient();
   const { data, error } = await admin
@@ -127,7 +128,7 @@ export async function runDueCalendarJobs(
     .select("id")
     .eq("status", "PENDING")
     .lte("run_after", new Date().toISOString())
-    .in("job_type", ["CALENDAR_SYNC", "WATCH_RENEWAL"])
+    .in("job_type", jobTypes)
     .order("run_after", { ascending: true })
     .limit(limit);
 
@@ -144,4 +145,20 @@ export async function runDueCalendarJobs(
   }
 
   return { attempted: data?.length ?? 0, done, retry, failed };
+}
+
+/** Cron fallback - recovers CALENDAR_SYNC/WATCH_RENEWAL/MEETING_PREPARATION jobs left PENDING after a failed webhook-triggered attempt. */
+export async function runDueCalendarJobs(
+  appOrigin: string,
+  limit = 10,
+): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
+  return runDueJobsOfTypes(appOrigin, [...CALENDAR_JOB_TYPES, ...PREPARATION_JOB_TYPES], limit);
+}
+
+/** Called right after a webhook-triggered CALENDAR_SYNC job succeeds, so a newly detected E1 meeting gets prepared immediately rather than waiting for the next cron sweep. */
+export async function runDuePreparationJobs(
+  appOrigin: string,
+  limit = 3,
+): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
+  return runDueJobsOfTypes(appOrigin, PREPARATION_JOB_TYPES, limit);
 }

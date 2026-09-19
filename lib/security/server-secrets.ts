@@ -31,3 +31,13 @@ export function getCronSecret(): string {
   if (!secret) throw new Error("CRON_SECRET is missing");
   return secret;
 }
+
+export function getGeminiCredentials(): { apiKey: string; model: string } {
+  const apiKey = process.env["GEMINI_API_KEY"];
+  if (!apiKey) throw new Error("GEMINI_API_KEY is missing");
+  return { apiKey, model: process.env["GEMINI_MODEL"] || "gemini-2.5-flash" };
+}
+
+export function hasGeminiCredentials(): boolean {
+  return Boolean(process.env["GEMINI_API_KEY"]);
+}

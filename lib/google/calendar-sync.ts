@@ -14,6 +14,9 @@ import {
 } from "@/lib/google/calendar-api";
 import { detectFsMeeting } from "@/lib/google/meeting-detection";
 import { hashCalendarChannelToken } from "@/lib/google/webhook";
+import { enqueueMeetingPreparationJob } from "@/lib/jobs/queue";
+import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility";
+import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
 
 const INITIAL_SYNC_LOOKBACK_DAYS = 30;
 const WATCH_RENEW_BEFORE_MS = 48 * 60 * 60 * 1000;
@@ -210,7 +213,7 @@ async function upsertCalendarEventAndMeeting(
   let meetingStatus = cancelled ? "CANCELLED" : (existingMeeting?.status ?? "DETECTED");
   if (!cancelled && meetingStatus === "CANCELLED") meetingStatus = "DETECTED";
 
-  const { error: meetingError } = await admin
+  const { data: storedMeeting, error: meetingError } = await admin
     .from("meetings")
     .upsert({
       calendar_event_id: storedEvent.id,
@@ -222,9 +225,54 @@ async function upsertCalendarEventAndMeeting(
       scheduled_end_at: endAt,
       source: "GOOGLE_CALENDAR",
       detection_rule: detection.ruleId,
-    }, { onConflict: "calendar_event_id" });
+    }, { onConflict: "calendar_event_id" })
+    .select("id")
+    .single();
 
-  if (meetingError) throw new Error("meeting_upsert_failed");
+  if (meetingError || !storedMeeting) throw new Error("meeting_upsert_failed");
+
+  await enqueueAutoPreparationIfEligible({
+    meetingId: storedMeeting.id,
+    fsUserId: context.connection.user_id,
+    meetingType: detection.meetingType,
+    meetingStatus,
+    scheduledStartAt: startAt,
+    event,
+  });
+}
+
+function sanitizeVersionToken(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || "v1";
+}
+
+async function enqueueAutoPreparationIfEligible(input: {
+  meetingId: string;
+  fsUserId: string;
+  meetingType: string;
+  meetingStatus: string;
+  scheduledStartAt: string | null;
+  event: GoogleCalendarEvent;
+}): Promise<void> {
+  const flag = await loadAutoPreparationFlag(input.fsUserId);
+  const eligible = isEligibleForAutoPreparation({
+    meetingType: input.meetingType,
+    meetingStatus: input.meetingStatus,
+    scheduledStartAt: input.scheduledStartAt,
+    flag,
+  });
+  if (!eligible) return;
+
+  const eventVersion = sanitizeVersionToken(input.event.etag ?? input.event.updated ?? "v1");
+  const dedupeKey = `meeting-prep:${input.meetingId}:${eventVersion}`;
+
+  try {
+    await enqueueMeetingPreparationJob({ meetingId: input.meetingId, dedupeKey });
+  } catch (error) {
+    console.error("meeting_preparation_job_enqueue_failed", {
+      meeting_id: input.meetingId,
+      code: safeCalendarErrorCode(error),
+    });
+  }
 }
 
 export async function syncGoogleCalendarConnection(

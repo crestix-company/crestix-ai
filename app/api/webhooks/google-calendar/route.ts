@@ -5,10 +5,14 @@ import {
   hashCalendarChannelToken,
   parseGoogleCalendarWebhookHeaders,
 } from "@/lib/google/webhook";
-import { enqueueCalendarSyncJob, processCalendarJob } from "@/lib/jobs/calendar-jobs";
+import { enqueueCalendarSyncJob, processCalendarJob, runDuePreparationJobs } from "@/lib/jobs/calendar-jobs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// The webhook responds 204 immediately, but after() keeps running in the
+// background to sync Calendar and then run any newly queued Gemini
+// preparation - both can take longer than the platform's short default.
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   const notification = parseGoogleCalendarWebhookHeaders(request.headers);
@@ -68,6 +72,17 @@ export async function POST(request: Request) {
           job_id: jobId,
           result,
         });
+
+        if (result === "done") {
+          try {
+            const preparation = await runDuePreparationJobs(origin);
+            console.info("calendar_webhook_preparation_jobs_processed", preparation);
+          } catch (preparationError) {
+            console.error("calendar_webhook_preparation_jobs_failed", {
+              code: preparationError instanceof Error ? preparationError.message : "unknown",
+            });
+          }
+        }
       });
     }
   }

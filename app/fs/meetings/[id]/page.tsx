@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import { AppShell } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
@@ -170,6 +171,26 @@ export default async function MeetingDetailPage({
                   )}
                 </div>
 
+                {preparation?.source_mode === "API" ? (
+                  <div className="rounded-md border bg-card p-3 text-sm">
+                    <p className="font-medium">
+                      {preparation.status === "READY" && "自動生成済み（Gemini 2.5 Flash）"}
+                      {preparation.status === "PREPARING" && "Gemini自動生成中です。しばらくしてから再読み込みしてください。"}
+                      {preparation.status === "FAILED" && "自動生成に失敗しました。手動ChatGPTフローをご利用ください。"}
+                    </p>
+                    {preparation.status !== "PREPARING" ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        最終生成日時: {formatDate(preparation.generated_at)}
+                      </p>
+                    ) : null}
+                    {preparation.status === "READY" ? (
+                      <Link className="mt-2 inline-block text-primary underline" href={`/fs/meetings/${id}/material`}>
+                        AI商談資料を開く
+                      </Link>
+                    ) : null}
+                  </div>
+                ) : null}
+
                 <form action={saveAction} className="space-y-3">
                   <label className="block text-sm font-medium" htmlFor="pastedText">
                     ChatGPTの調査結果を貼り付け
@@ -191,7 +212,7 @@ export default async function MeetingDetailPage({
         </Card>
       </div>
 
-      {isE1 && preparation ? (
+      {isE1 && preparation?.status === "READY" ? (
         <div className="mt-6 space-y-6">
           <Card>
             <CardHeader>
