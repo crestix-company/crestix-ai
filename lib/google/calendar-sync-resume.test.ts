@@ -100,6 +100,14 @@ describe("syncGoogleCalendarConnection - page resume", () => {
     expect(vi.mocked(listCalendarEventsPage).mock.calls[0][0]).toMatchObject({ pageToken: null });
     expect(vi.mocked(listCalendarEventsPage).mock.calls[1][0]).toMatchObject({ pageToken: "page-2-token" });
 
+    // A fresh sync (no syncToken, no resume pageToken) backfills 1 day back,
+    // not the old 30/3-day windows that timed out on a busy connection.
+    const initialTimeMin = new Date(
+      (vi.mocked(listCalendarEventsPage).mock.calls[0][0] as { initialTimeMin: string }).initialTimeMin,
+    );
+    const expectedOneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    expect(Math.abs(initialTimeMin.getTime() - expectedOneDayAgo)).toBeLessThan(5_000);
+
     // First watch update after page 1 persists the resume token.
     expect(watchUpdateCalls[0]).toMatchObject({ pending_page_token: "page-2-token" });
     // Final state: sync_token stored, pending_page_token cleared.

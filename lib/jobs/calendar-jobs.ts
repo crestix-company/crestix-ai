@@ -54,6 +54,17 @@ export async function processCalendarJob(
   const admin = createAdminClient();
   const now = new Date().toISOString();
 
+  /**
+   * Reclaiming here (not only in the cron/prep sweep) matters: the webhook
+   * path calls processCalendarJob directly for the one job it just
+   * enqueued and never goes through runDueJobsOfTypes at all, so a stale
+   * job from an earlier timed-out invocation was never being reclaimed by
+   * anything until the once-daily cron sweep. Confirmed in production:
+   * several CALENDAR_SYNC jobs accumulated stuck at RUNNING across repeated
+   * webhook-triggered retries because this call was previously missing here.
+   */
+  await reclaimStaleRunningJobs();
+
   const { data: pending, error: lookupError } = await admin
     .from("jobs")
     .select("id,job_type,google_connection_id,meeting_id,status,attempts,run_after")

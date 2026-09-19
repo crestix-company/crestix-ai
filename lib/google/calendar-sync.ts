@@ -22,14 +22,20 @@ import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
  * A full initial/resync backfill processes events sequentially (each with
  * several DB round trips) inside one serverless invocation capped at 60s.
  * 30 days was too wide for a busy connection - a from-scratch resync over
- * ~1800 events reliably hit the platform timeout mid-run, and because
- * sync_token is only persisted after the whole loop finishes, every retry
- * repeated the same full backfill and timed out again. Once sync_token is
- * successfully saved once, all later syncs are incremental via syncToken
- * regardless of this window, so a narrower initial window only affects how
- * far back the very first sync (or a 410-Gone recovery) backfills.
+ * ~1800 events reliably hit the platform timeout mid-run. The pageToken
+ * resume mechanism below (pending_page_token) makes an oversized backfill
+ * durable regardless of window size - it was verified live processing
+ * 1000+ events across many retries without ever losing progress - but for
+ * this product's MVP scope (detect today-or-later E1 meetings and prepare
+ * them automatically; a Skill-driven auto-prep run has never needed to look
+ * backward), a 3-day window still cost a very busy connection dozens of
+ * retries before its first sync_token landed. 1 day covers "today onward"
+ * detection with margin for same-day timezone edges, and once sync_token is
+ * saved once, all later syncs are incremental via syncToken regardless of
+ * this window - it only affects how far back the very first sync (or a
+ * 410-Gone recovery) backfills.
  */
-const INITIAL_SYNC_LOOKBACK_DAYS = 3;
+const INITIAL_SYNC_LOOKBACK_DAYS = 1;
 const WATCH_RENEW_BEFORE_MS = 48 * 60 * 60 * 1000;
 const WATCH_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SYNC_PAGES = 100;

@@ -65,6 +65,34 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+describe("processCalendarJob - stale RUNNING reclaim on a direct call", () => {
+  it("reclaims stale RUNNING jobs even when called directly for a single job (not via the sweep)", async () => {
+    // This is exactly the production scenario that went wrong: the webhook
+    // calls processCalendarJob directly for the one job it just enqueued,
+    // which never goes through runDueJobsOfTypes's sweep at all. Without a
+    // reclaim here too, an earlier job stuck RUNNING from a prior timed-out
+    // invocation was never reclaimed by anything until the daily cron.
+    const { client, calls } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-1", job_type: "MEETING_PREPARATION", google_connection_id: null, meeting_id: "meeting-1", status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [
+        { data: null, error: null }, // reclaim
+        { data: { id: "job-1" }, error: null }, // claim
+        { data: null, error: null }, // DONE
+      ],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-1", "https://example.test");
+
+    expect(result).toBe("done");
+    expect(calls.jobs[0]).toMatchObject({
+      status: "PENDING",
+      locked_at: null,
+      last_error_safe: "stale_running_reclaimed",
+    });
+  });
+});
+
 describe("processCalendarJob - MEETING_PREPARATION", () => {
   it("calls runAutoPreparationForMeeting with the job's meeting_id and marks the job DONE, without touching Calendar sync", async () => {
     const { client } = makeAdminMock({
@@ -141,9 +169,10 @@ describe("runDueCalendarJobs - stale RUNNING recovery", () => {
         { data: { id: "job-3", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 1, run_after: new Date(0).toISOString() } },
       ],
       "jobs:update": [
-        { data: null, error: null },
-        { data: { id: "job-3" }, error: null },
-        { data: null, error: null },
+        { data: null, error: null }, // reclaim inside runDueJobsOfTypes
+        { data: null, error: null }, // reclaim inside processCalendarJob
+        { data: { id: "job-3" }, error: null }, // claim
+        { data: null, error: null }, // DONE
       ],
     });
     vi.mocked(createAdminClient).mockReturnValue(client as never);
