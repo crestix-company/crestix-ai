@@ -48,6 +48,7 @@ type WatchRow = {
   channel_id: string;
   resource_id: string;
   sync_token: string | null;
+  pending_page_token: string | null;
   expiration_at: string;
   status: string;
 };
@@ -102,7 +103,7 @@ async function latestActiveWatch(connectionId: string): Promise<WatchRow | null>
   const admin = createAdminClient();
   const { data, error } = await admin
     .from("calendar_watch_channels")
-    .select("id,channel_id,resource_id,sync_token,expiration_at,status")
+    .select("id,channel_id,resource_id,sync_token,pending_page_token,expiration_at,status")
     .eq("google_connection_id", connectionId)
     .eq("status", "ACTIVE")
     .order("created_at", { ascending: false })
@@ -297,7 +298,7 @@ export async function syncGoogleCalendarConnection(
         const admin = createAdminClient();
         const { data, error } = await admin
           .from("calendar_watch_channels")
-          .select("id,channel_id,resource_id,sync_token,expiration_at,status")
+          .select("id,channel_id,resource_id,sync_token,pending_page_token,expiration_at,status")
           .eq("id", options.watchId)
           .eq("google_connection_id", connectionId)
           .maybeSingle();
@@ -309,13 +310,17 @@ export async function syncGoogleCalendarConnection(
   if (!watch) throw new Error("calendar_watch_missing");
 
   const syncToken = watch.sync_token;
-  const initialTimeMin = syncToken
+  // Resuming from a page token means the original query (timeMin, etc.) is
+  // already embedded in it - don't also send initialTimeMin.
+  const resuming = Boolean(watch.pending_page_token);
+  const initialTimeMin = syncToken || resuming
     ? null
     : new Date(Date.now() - INITIAL_SYNC_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
-  let pageToken: string | null = null;
+  let pageToken: string | null = watch.pending_page_token ?? null;
   let nextSyncToken: string | null = null;
   let eventCount = 0;
+  const admin = createAdminClient();
 
   for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
     let response;
@@ -334,10 +339,9 @@ export async function syncGoogleCalendarConnection(
         && syncToken
         && !options.retriedAfterGone
       ) {
-        const admin = createAdminClient();
         await admin
           .from("calendar_watch_channels")
-          .update({ sync_token: null })
+          .update({ sync_token: null, pending_page_token: null })
           .eq("id", watch.id);
         return syncGoogleCalendarConnection(connectionId, {
           accessToken,
@@ -355,13 +359,28 @@ export async function syncGoogleCalendarConnection(
 
     pageToken = response.nextPageToken ?? null;
     nextSyncToken = response.nextSyncToken ?? nextSyncToken;
+
+    /**
+     * Persisted after every page, not just at the end: a busy connection's
+     * from-scratch backfill can take longer than one serverless invocation
+     * (60s ceiling). Without this, a mid-run platform timeout made every
+     * retry restart the whole backfill from page 1 and time out again,
+     * indefinitely - confirmed in production against this account's actual
+     * event volume. Resuming from the last completed page instead lets a
+     * large backfill finish incrementally across several invocations.
+     */
+    await admin
+      .from("calendar_watch_channels")
+      .update({ pending_page_token: pageToken })
+      .eq("id", watch.id);
+
     if (!pageToken) break;
     if (page === MAX_SYNC_PAGES - 1) throw new Error("calendar_sync_page_limit");
   }
 
-  const admin = createAdminClient();
   const updatePayload: Record<string, unknown> = {
     last_synced_at: new Date().toISOString(),
+    pending_page_token: null,
   };
   if (nextSyncToken) updatePayload.sync_token = nextSyncToken;
 
