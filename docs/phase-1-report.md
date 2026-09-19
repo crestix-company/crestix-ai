@@ -1,7 +1,17 @@
 # Phase 1 report
 
-Date: 2026-09-18  
-Status: **IMPLEMENTATION IN PROGRESS — code reviewed and verified locally; source deployment and production Calendar acceptance smoke remain**
+Date: 2026-09-19  
+Status: **IMPLEMENTATION IN PROGRESS — deployed to Production; live Google OAuth + Calendar bootstrap exercised once, one concurrency bug found and fixed, re-verifying before GO**
+
+## Production bootstrap finding (this pass)
+
+The first real production OAuth login (`hiroyuki.maekawa@crestix-inc.com`, ADMIN) was completed and exercised the full bootstrap path against a real, busy Google Calendar. Result: `calendar_events` populated to 1671 rows and `meetings` correctly detected 5 real `HD` meetings (including two title-level cancellations via `キャンセル`/`アポキャンセル` prefixes) — the detection and upsert logic is correct on real data. However `calendar_watch_channels.last_synced_at` / `sync_token` were never persisted, and a `CALENDAR_SYNC` job ended in `PENDING` with `last_error_safe: "Error"`.
+
+Root cause: `ensureCalendarWatch()` (called from the OAuth callback's `after()` bootstrap) called `syncGoogleCalendarConnection()` **directly**, while Google's own automatic "sync" webhook notification — sent immediately after `events.watch` registration, confirmed firing in production logs 4ms after the watch row was created — independently triggered the *same* sync through the job queue. Both ran concurrently against the same 1671-event initial backfill with no shared lock, and one lost a race on an upsert (data itself stayed correct because upserts are idempotent; only the trailing `sync_token`/`last_synced_at` write was lost).
+
+Fix: `ensureCalendarWatch()` no longer calls `syncGoogleCalendarConnection()` itself. It only manages the Google push-channel lifecycle (create/renew); the initial and all subsequent syncs are driven exclusively through the job queue's single-claim path (Google's automatic "sync" notification for bootstrap, real notifications afterward, and the maintenance cron as a fallback). Also fixed `safeCalendarErrorCode()`, which was discarding the actual error identifier (`error.name`, always the generic string `"Error"` for plain `throw new Error("...")` call sites) instead of `error.message` (the deliberately-chosen safe identifier, e.g. `"calendar_event_upsert_failed"`) — this is what made the original failure hard to diagnose from `jobs.last_error_safe` alone. Added `lib/google/calendar-sync.test.ts` (3 tests) asserting `ensureCalendarWatch()` never calls `listCalendarEventsPage` in any branch.
+
+Residual, accepted for Phase 1 MVP scope (6-person company): two *different* job rows for the same connection (e.g. a webhook notification and a cron sweep landing at nearly the same instant) can still process concurrently, since only a single job row's own claim is atomic, not per-connection. Idempotent upserts bound the damage to the same cosmetic `last_synced_at` non-update, not data corruption. A per-connection advisory lock would close this but is not justified at current volume; revisit if real concurrent-notification collisions are observed.
 
 ## Code review findings (this pass)
 

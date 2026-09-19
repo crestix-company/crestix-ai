@@ -47,7 +47,7 @@ function safeCalendarErrorCode(error: unknown): string {
   if (error instanceof GoogleCalendarApiError) {
     return `${error.operation}:${error.status}`.slice(0, 160);
   }
-  if (error instanceof Error) return error.name.slice(0, 160);
+  if (error instanceof Error) return (error.message || error.name).slice(0, 160);
   return "unknown";
 }
 
@@ -316,6 +316,16 @@ export async function syncGoogleCalendarConnection(
   return { eventCount, syncTokenStored: Boolean(nextSyncToken) };
 }
 
+/**
+ * Only manages the Google push channel lifecycle. It deliberately does not
+ * call syncGoogleCalendarConnection itself: registering a watch always makes
+ * Google deliver an immediate "sync" webhook notification, which drives the
+ * first sync through the job queue's single-claim path. Syncing here too
+ * raced that webhook-triggered sync on the same connection with no shared
+ * lock, and lost a race mid-backfill in production (calendar_watch_channels
+ * ended up with sync_token/last_synced_at never persisted even though the
+ * events had already landed).
+ */
 export async function ensureCalendarWatch(
   connectionId: string,
   appOrigin: string,
@@ -329,10 +339,6 @@ export async function ensureCalendarWatch(
     && !options.force
     && new Date(currentWatch.expiration_at).getTime() > Date.now() + WATCH_RENEW_BEFORE_MS
   ) {
-    await syncGoogleCalendarConnection(connectionId, {
-      accessToken: options.accessToken,
-      watchId: currentWatch.id,
-    });
     return { watchId: currentWatch.id, renewed: false };
   }
 
@@ -388,11 +394,6 @@ export async function ensureCalendarWatch(
       console.warn("calendar_old_watch_stop_failed", { code: safeCalendarErrorCode(error) });
     }
   }
-
-  await syncGoogleCalendarConnection(connectionId, {
-    accessToken,
-    watchId: newWatch.id,
-  });
 
   return { watchId: newWatch.id, renewed: true };
 }
