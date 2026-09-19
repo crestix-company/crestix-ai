@@ -13,6 +13,26 @@ export { enqueueCalendarSyncJob, enqueueMeetingPreparationJob } from "@/lib/jobs
 const MAX_ATTEMPTS = 5;
 const PREPARATION_JOB_TYPES = ["MEETING_PREPARATION"] as const;
 const CALENDAR_JOB_TYPES = ["CALENDAR_SYNC", "WATCH_RENEWAL"] as const;
+const STALE_RUNNING_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * A job stays RUNNING once claimed until its own try/catch writes DONE/
+ * PENDING/FAILED. A hard platform timeout (function killed mid-run, no JS
+ * exception) skips that write entirely, so without this the job is stuck
+ * RUNNING forever - nothing else re-claims it, since claiming only looks at
+ * PENDING rows. Reclaiming anything RUNNING for longer than any plausible
+ * invocation (well past the 60s maxDuration ceiling) makes it retryable
+ * again through the normal PENDING path.
+ */
+async function reclaimStaleRunningJobs(): Promise<void> {
+  const admin = createAdminClient();
+  const threshold = new Date(Date.now() - STALE_RUNNING_THRESHOLD_MS).toISOString();
+  await admin
+    .from("jobs")
+    .update({ status: "PENDING", locked_at: null, last_error_safe: "stale_running_reclaimed" })
+    .eq("status", "RUNNING")
+    .lt("locked_at", threshold);
+}
 
 async function markPreparationFailed(meetingId: string): Promise<void> {
   const admin = createAdminClient();
@@ -122,6 +142,8 @@ async function runDueJobsOfTypes(
   jobTypes: readonly string[],
   limit: number,
 ): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
+  await reclaimStaleRunningJobs();
+
   const admin = createAdminClient();
   const { data, error } = await admin
     .from("jobs")

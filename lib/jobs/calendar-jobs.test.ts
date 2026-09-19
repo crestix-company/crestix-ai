@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ensureCalendarWatch, syncGoogleCalendarConnection } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
-import { processCalendarJob } from "./calendar-jobs";
+import { processCalendarJob, runDueCalendarJobs } from "./calendar-jobs";
 
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
 vi.mock("@/lib/google/calendar-sync", () => ({
@@ -21,6 +21,11 @@ interface FakeChain extends PromiseLike<Canned> {
   update(...args: unknown[]): FakeChain;
   eq(...args: unknown[]): FakeChain;
   neq(...args: unknown[]): FakeChain;
+  lt(...args: unknown[]): FakeChain;
+  lte(...args: unknown[]): FakeChain;
+  in(...args: unknown[]): FakeChain;
+  order(...args: unknown[]): FakeChain;
+  limit(...args: unknown[]): FakeChain;
   maybeSingle(): Promise<Canned>;
 }
 
@@ -43,6 +48,11 @@ function makeAdminMock(queues: Record<string, Canned[]>) {
       },
       eq: () => chain,
       neq: () => chain,
+      lt: () => chain,
+      lte: () => chain,
+      in: () => chain,
+      order: () => chain,
+      limit: () => chain,
       maybeSingle: () => resolve(),
       then: (onFulfilled, onRejected) => resolve().then(onFulfilled, onRejected),
     };
@@ -120,5 +130,32 @@ describe("processCalendarJob - CALENDAR_SYNC", () => {
     expect(result).toBe("done");
     expect(syncGoogleCalendarConnection).toHaveBeenCalledWith("conn-1");
     expect(runAutoPreparationForMeeting).not.toHaveBeenCalled();
+  });
+});
+
+describe("runDueCalendarJobs - stale RUNNING recovery", () => {
+  it("resets jobs stuck RUNNING past the staleness threshold to PENDING before picking up due work", async () => {
+    const { client, calls } = makeAdminMock({
+      "jobs:select": [
+        { data: [{ id: "job-3" }], error: null },
+        { data: { id: "job-3", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 1, run_after: new Date(0).toISOString() } },
+      ],
+      "jobs:update": [
+        { data: null, error: null },
+        { data: { id: "job-3" }, error: null },
+        { data: null, error: null },
+      ],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await runDueCalendarJobs("https://example.test", 10);
+
+    const firstUpdate = calls.jobs[0] as Record<string, unknown>;
+    expect(firstUpdate).toMatchObject({
+      status: "PENDING",
+      locked_at: null,
+      last_error_safe: "stale_running_reclaimed",
+    });
+    expect(syncGoogleCalendarConnection).toHaveBeenCalledWith("conn-1");
   });
 });

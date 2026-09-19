@@ -18,7 +18,18 @@ import { enqueueMeetingPreparationJob } from "@/lib/jobs/queue";
 import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility";
 import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
 
-const INITIAL_SYNC_LOOKBACK_DAYS = 30;
+/**
+ * A full initial/resync backfill processes events sequentially (each with
+ * several DB round trips) inside one serverless invocation capped at 60s.
+ * 30 days was too wide for a busy connection - a from-scratch resync over
+ * ~1800 events reliably hit the platform timeout mid-run, and because
+ * sync_token is only persisted after the whole loop finishes, every retry
+ * repeated the same full backfill and timed out again. Once sync_token is
+ * successfully saved once, all later syncs are incremental via syncToken
+ * regardless of this window, so a narrower initial window only affects how
+ * far back the very first sync (or a 410-Gone recovery) backfills.
+ */
+const INITIAL_SYNC_LOOKBACK_DAYS = 3;
 const WATCH_RENEW_BEFORE_MS = 48 * 60 * 60 * 1000;
 const WATCH_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SYNC_PAGES = 100;
