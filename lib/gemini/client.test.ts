@@ -57,6 +57,21 @@ describe("researchClinic", () => {
     global.fetch = vi.fn().mockResolvedValue({ ok: false, status: 503 }) as never;
     await expect(researchClinic("x")).rejects.toThrow("Gemini API operation failed");
   });
+
+  it("captures Google's error response body in the thrown error, so a config problem (wrong model/API version) is distinguishable from a transient failure without needing to guess at secret values", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: async () => "{\"error\":{\"code\":404,\"message\":\"models/bad-model is not found for API version v1beta\",\"status\":\"NOT_FOUND\"}}",
+    }) as never;
+
+    await expect(researchClinic("x")).rejects.toThrow(/models\/bad-model is not found/);
+  });
+
+  it("does not throw when the error response has no readable body (e.g. a mocked/malformed response)", async () => {
+    global.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500 }) as never;
+    await expect(researchClinic("x")).rejects.toThrow("Gemini API operation failed: generate_content (500)");
+  });
 });
 
 describe("generateStructuredJson", () => {

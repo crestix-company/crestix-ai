@@ -9,8 +9,18 @@ export class GeminiApiError extends Error {
   constructor(
     readonly operation: string,
     readonly status: number,
+    /**
+     * Google's error response body (e.g. "models/x is not found for API
+     * version v1beta") - safe to surface: it describes the requested
+     * resource/request shape, never echoes the API key (sent only in a
+     * request header, never reflected back). Without this, a config
+     * problem (wrong model name, wrong API version) was indistinguishable
+     * from a transient failure in last_error_safe - just "(404)" with no
+     * way to diagnose it without guessing at the actual secret values.
+     */
+    readonly detail?: string,
   ) {
-    super(`Gemini API operation failed: ${operation} (${status})`);
+    super(`Gemini API operation failed: ${operation} (${status})${detail ? ` - ${detail}` : ""}`);
     this.name = "GeminiApiError";
   }
 }
@@ -70,7 +80,15 @@ async function callGemini(body: Record<string, unknown>): Promise<GeminiGenerate
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
-  if (!response.ok) throw new GeminiApiError("generate_content", response.status);
+  if (!response.ok) {
+    let detail: string | undefined;
+    try {
+      detail = (await response.text()).slice(0, 300);
+    } catch {
+      detail = undefined;
+    }
+    throw new GeminiApiError("generate_content", response.status, detail);
+  }
   return await response.json() as GeminiGenerateContentResponse;
 }
 

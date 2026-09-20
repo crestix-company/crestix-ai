@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAppOrigin } from "@/lib/auth/app-origin";
 import { SYNC_TIME_BUDGET_MS } from "@/lib/google/calendar-sync";
-import { runJobToCompletionOrBudget } from "@/lib/jobs/calendar-jobs";
+import { runDuePreparationJobs, runJobToCompletionOrBudget } from "@/lib/jobs/calendar-jobs";
 import { isValidInternalBearerToken } from "@/lib/security/internal-auth";
 
 export const runtime = "nodejs";
@@ -32,6 +32,27 @@ export async function POST(request: Request) {
   const appOrigin = getAppOrigin(request.headers);
   const deadline = Date.now() + SYNC_TIME_BUDGET_MS;
   const result = await runJobToCompletionOrBudget(jobId, appOrigin, deadline);
+  console.info("calendar_sync_continue_job_processed", { job_id: jobId, result });
+
+  if (result === "done") {
+    try {
+      // Mirrors the webhook route: a CALENDAR_SYNC job that finishes via a
+      // self-continuation chain (rather than the original webhook request)
+      // still needs its freshly-enqueued MEETING_PREPARATION job swept -
+      // without this, that job sits PENDING until the next cron tick.
+      let sweep = await runDuePreparationJobs(appOrigin);
+      let rounds = 0;
+      while (sweep.attempted > 0 && (sweep.done > 0 || sweep.retry > 0) && rounds < 5) {
+        sweep = await runDuePreparationJobs(appOrigin);
+        rounds += 1;
+      }
+      console.info("calendar_sync_continue_preparation_jobs_processed", sweep);
+    } catch (preparationError) {
+      console.error("calendar_sync_continue_preparation_jobs_failed", {
+        code: preparationError instanceof Error ? preparationError.message : "unknown",
+      });
+    }
+  }
 
   return NextResponse.json({ ok: true, jobId, result });
 }
