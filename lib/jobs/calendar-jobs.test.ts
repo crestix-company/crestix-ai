@@ -2,13 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ensureCalendarWatch, syncGoogleCalendarConnection } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
-import { processCalendarJob, runDueCalendarJobs } from "./calendar-jobs";
+import { processCalendarJob, runDueCalendarJobs, runJobToCompletionOrBudget } from "./calendar-jobs";
 
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
 vi.mock("@/lib/google/calendar-sync", () => ({
-  syncGoogleCalendarConnection: vi.fn().mockResolvedValue({ eventCount: 0, syncTokenStored: false }),
+  syncGoogleCalendarConnection: vi.fn().mockResolvedValue({ eventCount: 0, syncTokenStored: false, completed: true }),
   ensureCalendarWatch: vi.fn().mockResolvedValue({ watchId: "watch-1", renewed: false }),
   safeCalendarErrorCode: (error: unknown) => (error instanceof Error ? error.message : "unknown"),
+  SYNC_TIME_BUDGET_MS: 45_000,
 }));
 vi.mock("@/lib/preparation/auto-generate", () => ({
   runAutoPreparationForMeeting: vi.fn().mockResolvedValue(undefined),
@@ -156,8 +157,60 @@ describe("processCalendarJob - CALENDAR_SYNC", () => {
     const result = await processCalendarJob("job-2", "https://example.test");
 
     expect(result).toBe("done");
-    expect(syncGoogleCalendarConnection).toHaveBeenCalledWith("conn-1");
+    expect(syncGoogleCalendarConnection).toHaveBeenCalledWith(
+      "conn-1",
+      expect.objectContaining({ deadline: expect.any(Number) }),
+    );
     expect(runAutoPreparationForMeeting).not.toHaveBeenCalled();
+  });
+
+  it("checkpoints gracefully without consuming an attempt when the sync reports it did not complete", async () => {
+    // This is the point-C guarantee: normal pagination continuation (time
+    // budget hit mid-backfill, pending_page_token already persisted by
+    // syncGoogleCalendarConnection itself) must NOT count against
+    // MAX_ATTEMPTS the way a genuine Google API error does.
+    vi.mocked(syncGoogleCalendarConnection).mockResolvedValueOnce({
+      eventCount: 100,
+      syncTokenStored: false,
+      completed: false,
+    });
+    const { client, calls } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-2", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 2, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-2" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-2", "https://example.test");
+
+    expect(result).toBe("continuing");
+    const checkpointUpdate = calls.jobs[calls.jobs.length - 1] as Record<string, unknown>;
+    expect(checkpointUpdate).toMatchObject({
+      status: "PENDING",
+      // Reverted back to the pre-claim value (2), not the claimed nextAttempts (3).
+      attempts: 2,
+      locked_at: null,
+    });
+  });
+});
+
+describe("runJobToCompletionOrBudget", () => {
+  it("keeps re-invoking the same job while it reports continuing, until it finishes within the shared deadline", async () => {
+    vi.mocked(syncGoogleCalendarConnection)
+      .mockResolvedValueOnce({ eventCount: 100, syncTokenStored: false, completed: false })
+      .mockResolvedValueOnce({ eventCount: 40, syncTokenStored: true, completed: true });
+
+    const { client } = makeAdminMock({
+      "jobs:select": [
+        { data: { id: "job-2", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } },
+      ],
+      "jobs:update": [{ data: { id: "job-2" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await runJobToCompletionOrBudget("job-2", "https://example.test", Date.now() + 45_000);
+
+    expect(result).toBe("done");
+    expect(syncGoogleCalendarConnection).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -185,6 +238,9 @@ describe("runDueCalendarJobs - stale RUNNING recovery", () => {
       locked_at: null,
       last_error_safe: "stale_running_reclaimed",
     });
-    expect(syncGoogleCalendarConnection).toHaveBeenCalledWith("conn-1");
+    expect(syncGoogleCalendarConnection).toHaveBeenCalledWith(
+      "conn-1",
+      expect.objectContaining({ deadline: expect.any(Number) }),
+    );
   });
 });

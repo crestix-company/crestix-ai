@@ -5,7 +5,12 @@ import {
   hashCalendarChannelToken,
   parseGoogleCalendarWebhookHeaders,
 } from "@/lib/google/webhook";
-import { enqueueCalendarSyncJob, processCalendarJob, runDuePreparationJobs } from "@/lib/jobs/calendar-jobs";
+import {
+  enqueueCalendarSyncJob,
+  runDuePreparationJobs,
+  runJobToCompletionOrBudget,
+} from "@/lib/jobs/calendar-jobs";
+import { SYNC_TIME_BUDGET_MS } from "@/lib/google/calendar-sync";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -67,7 +72,11 @@ export async function POST(request: Request) {
     if (appOrigin) {
       const origin = appOrigin;
       after(async () => {
-        const result = await processCalendarJob(jobId, origin);
+        // Shared for every round of runJobToCompletionOrBudget below, so a
+        // large CALENDAR_SYNC backfill that needs several checkpointed
+        // rounds still respects one true budget for this whole invocation.
+        const deadline = Date.now() + SYNC_TIME_BUDGET_MS;
+        const result = await runJobToCompletionOrBudget(jobId, origin, deadline);
         console.info("calendar_webhook_job_processed", {
           job_id: jobId,
           result,

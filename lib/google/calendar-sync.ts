@@ -19,26 +19,33 @@ import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility
 import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
 
 /**
- * A full initial/resync backfill processes events sequentially (each with
- * several DB round trips) inside one serverless invocation capped at 60s.
- * 30 days was too wide for a busy connection - a from-scratch resync over
- * ~1800 events reliably hit the platform timeout mid-run. The pageToken
- * resume mechanism below (pending_page_token) makes an oversized backfill
- * durable regardless of window size - it was verified live processing
- * 1000+ events across many retries without ever losing progress - but for
- * this product's MVP scope (detect today-or-later E1 meetings and prepare
- * them automatically; a Skill-driven auto-prep run has never needed to look
- * backward), a 3-day window still cost a very busy connection dozens of
- * retries before its first sync_token landed. 1 day covers "today onward"
- * detection with margin for same-day timezone edges, and once sync_token is
- * saved once, all later syncs are incremental via syncToken regardless of
- * this window - it only affects how far back the very first sync (or a
- * 410-Gone recovery) backfills.
+ * Both bounds matter for an initial (non-syncToken) sync. timeMin alone
+ * looked narrow ("1 day back") but has no upper bound: with
+ * singleEvents=true, a recurring series with no end date expands forward
+ * indefinitely, so events.list can return effectively unbounded results
+ * from now to years out regardless of how tight timeMin is - confirmed
+ * live, where a "1 day" window still produced 3000+ rows because it had no
+ * timeMax. Bounding the future side to a year covers this product's actual
+ * need (detect upcoming E1 meetings) without unbounded recurring expansion.
+ * Once sync_token is saved once, all later syncs are incremental via
+ * syncToken regardless of these windows - they only affect how far the very
+ * first sync (or a 410-Gone recovery) looks.
  */
 const INITIAL_SYNC_LOOKBACK_DAYS = 1;
+const INITIAL_SYNC_LOOKAHEAD_DAYS = 365;
 const WATCH_RENEW_BEFORE_MS = 48 * 60 * 60 * 1000;
 const WATCH_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SYNC_PAGES = 100;
+/**
+ * A single serverless invocation is capped at 60s. Rather than process
+ * pages until the platform kills the function mid-run (which previously
+ * left a job stuck at RUNNING until a separate stale-job reclaim caught
+ * it), the sync loop checks this budget before starting each page and
+ * returns a controlled, already-durable "not yet complete" result once
+ * exceeded. 45s leaves the caller (webhook/cron route) margin for its own
+ * overhead below the 60s ceiling.
+ */
+export const SYNC_TIME_BUDGET_MS = 45_000;
 
 type ConnectionRow = {
   id: string;
@@ -295,8 +302,15 @@ async function enqueueAutoPreparationIfEligible(input: {
 
 export async function syncGoogleCalendarConnection(
   connectionId: string,
-  options: { accessToken?: string; watchId?: string; retriedAfterGone?: boolean } = {},
-): Promise<{ eventCount: number; syncTokenStored: boolean }> {
+  options: {
+    accessToken?: string;
+    watchId?: string;
+    retriedAfterGone?: boolean;
+    /** Absolute epoch ms this call must return by. Defaults to SYNC_TIME_BUDGET_MS from now. */
+    deadline?: number;
+  } = {},
+): Promise<{ eventCount: number; syncTokenStored: boolean; completed: boolean }> {
+  const deadline = options.deadline ?? Date.now() + SYNC_TIME_BUDGET_MS;
   const context = await loadConnectionContext(connectionId);
   const accessToken = await accessTokenForConnection(context.connection, options.accessToken);
   const watch = options.watchId
@@ -316,12 +330,16 @@ export async function syncGoogleCalendarConnection(
   if (!watch) throw new Error("calendar_watch_missing");
 
   const syncToken = watch.sync_token;
-  // Resuming from a page token means the original query (timeMin, etc.) is
-  // already embedded in it - don't also send initialTimeMin.
+  // Resuming from a page token means the original query (timeMin/timeMax) is
+  // already embedded in it - don't also send them.
   const resuming = Boolean(watch.pending_page_token);
-  const initialTimeMin = syncToken || resuming
+  const boundedInitialQuery = syncToken || resuming;
+  const initialTimeMin = boundedInitialQuery
     ? null
     : new Date(Date.now() - INITIAL_SYNC_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const initialTimeMax = boundedInitialQuery
+    ? null
+    : new Date(Date.now() + INITIAL_SYNC_LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   let pageToken: string | null = watch.pending_page_token ?? null;
   let nextSyncToken: string | null = null;
@@ -329,6 +347,14 @@ export async function syncGoogleCalendarConnection(
   const admin = createAdminClient();
 
   for (let page = 0; page < MAX_SYNC_PAGES; page += 1) {
+    if (Date.now() >= deadline) {
+      // Graceful, self-imposed checkpoint - never rely on the platform's
+      // hard timeout as control flow. pending_page_token already reflects
+      // every page fully processed so far (persisted below each iteration),
+      // so this is a fully durable stopping point, not a failure.
+      return { eventCount, syncTokenStored: false, completed: false };
+    }
+
     let response;
     try {
       response = await listCalendarEventsPage({
@@ -337,6 +363,7 @@ export async function syncGoogleCalendarConnection(
         syncToken,
         pageToken,
         initialTimeMin,
+        initialTimeMax,
       });
     } catch (error) {
       if (
@@ -349,10 +376,12 @@ export async function syncGoogleCalendarConnection(
           .from("calendar_watch_channels")
           .update({ sync_token: null, pending_page_token: null })
           .eq("id", watch.id);
+        // Falls back through the same bounded initial-query path above.
         return syncGoogleCalendarConnection(connectionId, {
           accessToken,
           watchId: watch.id,
           retriedAfterGone: true,
+          deadline,
         });
       }
       throw error;
@@ -397,7 +426,7 @@ export async function syncGoogleCalendarConnection(
 
   if (watchUpdateError) throw new Error("calendar_watch_sync_state_update_failed");
 
-  return { eventCount, syncTokenStored: Boolean(nextSyncToken) };
+  return { eventCount, syncTokenStored: Boolean(nextSyncToken), completed: true };
 }
 
 /**

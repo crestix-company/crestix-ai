@@ -95,18 +95,32 @@ describe("syncGoogleCalendarConnection - page resume", () => {
 
     const result = await syncGoogleCalendarConnection("conn-1", { accessToken: "token-x" });
 
-    expect(result).toEqual({ eventCount: 2, syncTokenStored: true });
+    expect(result).toEqual({ eventCount: 2, syncTokenStored: true, completed: true });
     expect(listCalendarEventsPage).toHaveBeenCalledTimes(2);
     expect(vi.mocked(listCalendarEventsPage).mock.calls[0][0]).toMatchObject({ pageToken: null });
     expect(vi.mocked(listCalendarEventsPage).mock.calls[1][0]).toMatchObject({ pageToken: "page-2-token" });
 
-    // A fresh sync (no syncToken, no resume pageToken) backfills 1 day back,
-    // not the old 30/3-day windows that timed out on a busy connection.
+    // A fresh sync (no syncToken, no resume pageToken) backfills 1 day back
+    // and bounds the future side too, so an unbounded recurring series can't
+    // make "1 day back" balloon into an effectively unbounded query.
     const initialTimeMin = new Date(
       (vi.mocked(listCalendarEventsPage).mock.calls[0][0] as { initialTimeMin: string }).initialTimeMin,
     );
     const expectedOneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     expect(Math.abs(initialTimeMin.getTime() - expectedOneDayAgo)).toBeLessThan(5_000);
+
+    const initialTimeMax = new Date(
+      (vi.mocked(listCalendarEventsPage).mock.calls[0][0] as { initialTimeMax: string }).initialTimeMax,
+    );
+    const expectedOneYearAhead = Date.now() + 365 * 24 * 60 * 60 * 1000;
+    expect(Math.abs(initialTimeMax.getTime() - expectedOneYearAhead)).toBeLessThan(5_000);
+
+    // Paginating the SAME initial query (via pageToken, not syncToken) must
+    // keep repeating the original timeMin/timeMax on every page - only a
+    // syncToken-only request omits them.
+    expect(
+      (vi.mocked(listCalendarEventsPage).mock.calls[1][0] as { initialTimeMin: string }).initialTimeMin,
+    ).toBe((vi.mocked(listCalendarEventsPage).mock.calls[0][0] as { initialTimeMin: string }).initialTimeMin);
 
     // First watch update after page 1 persists the resume token.
     expect(watchUpdateCalls[0]).toMatchObject({ pending_page_token: "page-2-token" });

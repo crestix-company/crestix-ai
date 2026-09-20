@@ -85,19 +85,29 @@ export async function listCalendarEventsPage(input: {
   syncToken?: string | null;
   pageToken?: string | null;
   initialTimeMin?: string | null;
+  initialTimeMax?: string | null;
 }): Promise<GoogleCalendarEventsPage> {
   const url = new URL(
     `${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(input.calendarId)}/events`,
   );
   url.searchParams.set("singleEvents", "true");
   url.searchParams.set("showDeleted", "true");
-  url.searchParams.set("maxResults", "250");
+  // Kept well under the ~45s soft time budget one sync invocation gives
+  // itself per page (each event costs several sequential DB round trips).
+  url.searchParams.set("maxResults", "100");
   url.searchParams.append("eventTypes", "default");
 
   if (input.syncToken) {
+    // Google forbids timeMin/timeMax alongside syncToken - the token
+    // already encodes the original query's bounds.
     url.searchParams.set("syncToken", input.syncToken);
-  } else if (input.initialTimeMin) {
-    url.searchParams.set("timeMin", input.initialTimeMin);
+  } else {
+    // timeMin alone has no upper bound: with singleEvents=true a recurring
+    // series with no end date expands forward indefinitely, so an initial
+    // sync without timeMax can return effectively unbounded results
+    // regardless of how narrow timeMin is. Both bounds are required.
+    if (input.initialTimeMin) url.searchParams.set("timeMin", input.initialTimeMin);
+    if (input.initialTimeMax) url.searchParams.set("timeMax", input.initialTimeMax);
   }
   if (input.pageToken) url.searchParams.set("pageToken", input.pageToken);
 

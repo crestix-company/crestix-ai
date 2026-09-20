@@ -5,6 +5,7 @@ import {
   ensureCalendarWatch,
   safeCalendarErrorCode,
   syncGoogleCalendarConnection,
+  SYNC_TIME_BUDGET_MS,
 } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
 
@@ -50,7 +51,9 @@ async function markPreparationFailed(meetingId: string): Promise<void> {
 export async function processCalendarJob(
   jobId: string,
   appOrigin: string,
-): Promise<"done" | "skipped" | "retry" | "failed"> {
+  /** Absolute epoch ms this (and any chained) call should finish syncing by. */
+  deadline: number = Date.now() + SYNC_TIME_BUDGET_MS,
+): Promise<"done" | "skipped" | "retry" | "failed" | "continuing"> {
   const admin = createAdminClient();
   const now = new Date().toISOString();
 
@@ -93,7 +96,30 @@ export async function processCalendarJob(
   try {
     if (pending.job_type === "CALENDAR_SYNC") {
       if (!pending.google_connection_id) throw new Error("calendar_job_connection_missing");
-      await syncGoogleCalendarConnection(pending.google_connection_id);
+      const result = await syncGoogleCalendarConnection(pending.google_connection_id, { deadline });
+
+      if (!result.completed) {
+        /**
+         * A graceful time-budget checkpoint, not a failure: pending_page_token
+         * already durably reflects every page finished so far. Reverting
+         * attempts back to its pre-claim value means paging through a large
+         * backfill never counts against MAX_ATTEMPTS - only genuine errors
+         * (thrown from the sync itself) do. run_after is "now" so the next
+         * sweep or webhook-triggered call can continue immediately.
+         */
+        await admin
+          .from("jobs")
+          .update({
+            status: "PENDING",
+            attempts: pending.attempts,
+            locked_at: null,
+            last_error_safe: null,
+            run_after: new Date().toISOString(),
+          })
+          .eq("id", jobId);
+
+        return "continuing";
+      }
     } else if (pending.job_type === "WATCH_RENEWAL") {
       if (!pending.google_connection_id) throw new Error("calendar_job_connection_missing");
       await ensureCalendarWatch(pending.google_connection_id, appOrigin, { force: true });
@@ -148,11 +174,31 @@ export async function processCalendarJob(
   }
 }
 
+/**
+ * Keeps re-invoking processCalendarJob for the same job while it reports
+ * "continuing" (a graceful time-budget checkpoint, not a failure), sharing
+ * one deadline across every round so the loop itself never runs the job
+ * past the true remaining budget. Used by both the sweep below and the
+ * webhook route, so a large CALENDAR_SYNC backfill makes as much durable
+ * progress as fits in one invocation instead of stopping after one page.
+ */
+export async function runJobToCompletionOrBudget(
+  jobId: string,
+  appOrigin: string,
+  deadline: number,
+): Promise<"done" | "skipped" | "retry" | "failed" | "continuing"> {
+  let result = await processCalendarJob(jobId, appOrigin, deadline);
+  while (result === "continuing" && Date.now() < deadline) {
+    result = await processCalendarJob(jobId, appOrigin, deadline);
+  }
+  return result;
+}
+
 async function runDueJobsOfTypes(
   appOrigin: string,
   jobTypes: readonly string[],
   limit: number,
-): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
+): Promise<{ attempted: number; done: number; retry: number; failed: number; continuing: number }> {
   await reclaimStaleRunningJobs();
 
   const admin = createAdminClient();
@@ -167,24 +213,32 @@ async function runDueJobsOfTypes(
 
   if (error) throw new Error("calendar_jobs_lookup_failed");
 
+  // Shared across every job in this sweep, not reset per row: bounds the
+  // whole sweep call to a safe margin below the platform's 60s ceiling
+  // regardless of how many jobs are due.
+  const deadline = Date.now() + SYNC_TIME_BUDGET_MS;
+
   let done = 0;
   let retry = 0;
   let failed = 0;
+  let continuing = 0;
   for (const row of data ?? []) {
-    const result = await processCalendarJob(row.id, appOrigin);
+    if (Date.now() >= deadline) break;
+    const result = await runJobToCompletionOrBudget(row.id, appOrigin, deadline);
     if (result === "done") done += 1;
     if (result === "retry") retry += 1;
     if (result === "failed") failed += 1;
+    if (result === "continuing") continuing += 1;
   }
 
-  return { attempted: data?.length ?? 0, done, retry, failed };
+  return { attempted: data?.length ?? 0, done, retry, failed, continuing };
 }
 
 /** Cron fallback - recovers CALENDAR_SYNC/WATCH_RENEWAL/MEETING_PREPARATION jobs left PENDING after a failed webhook-triggered attempt. */
 export async function runDueCalendarJobs(
   appOrigin: string,
   limit = 10,
-): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
+): Promise<{ attempted: number; done: number; retry: number; failed: number; continuing: number }> {
   return runDueJobsOfTypes(appOrigin, [...CALENDAR_JOB_TYPES, ...PREPARATION_JOB_TYPES], limit);
 }
 
@@ -192,6 +246,6 @@ export async function runDueCalendarJobs(
 export async function runDuePreparationJobs(
   appOrigin: string,
   limit = 3,
-): Promise<{ attempted: number; done: number; retry: number; failed: number }> {
+): Promise<{ attempted: number; done: number; retry: number; failed: number; continuing: number }> {
   return runDueJobsOfTypes(appOrigin, PREPARATION_JOB_TYPES, limit);
 }
