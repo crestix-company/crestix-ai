@@ -52,12 +52,6 @@ const validPreparationJson = JSON.stringify({
   sources: [{ url: "https://example.com/clinic" }],
 });
 
-const validMaterialJson = JSON.stringify({
-  title: "資料", executive_summary: "要約",
-  slides: [{ title: "1. 医院サマリー", purpose: "", bullets: [], speaker_notes: "", sources: [] }],
-  document_markdown: "# 資料",
-});
-
 type Canned = { data?: unknown; error?: unknown };
 
 interface FakeChain extends PromiseLike<Canned> {
@@ -117,15 +111,18 @@ describe("runAutoPreparationForMeeting", () => {
     expect(calls["meetings:update"]).toBeUndefined();
   });
 
-  it("saves a READY preparation and a READY material on the happy path", async () => {
+  it("saves a READY preparation and enqueues a MATERIAL_GENERATION job on the happy path", async () => {
+    // Material generation is no longer run inline (see
+    // lib/preparation/material-generate.ts and its own test file) - a
+    // successful Preparation only enqueues the independent job.
     vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
     vi.mocked(researchClinic).mockResolvedValue({
       summary: "調査結果", sources: [{ url: "https://example.com/clinic" }], searchCallCount: 1,
       usage: { inputTokens: 10, outputTokens: 20 },
     });
-    vi.mocked(generateStructuredJson)
-      .mockResolvedValueOnce({ rawText: validPreparationJson, usage: { inputTokens: 30, outputTokens: 40 } })
-      .mockResolvedValueOnce({ rawText: validMaterialJson, usage: { inputTokens: 5, outputTokens: 6 } });
+    vi.mocked(generateStructuredJson).mockResolvedValueOnce({
+      rawText: validPreparationJson, usage: { inputTokens: 30, outputTokens: 40 },
+    });
 
     const { client, calls } = makeAdminMock({
       "meetings:select": [{ data: meetingRow, error: null }],
@@ -133,6 +130,7 @@ describe("runAutoPreparationForMeeting", () => {
       "agent_runs:insert": [{ data: { id: "agent-run-1" }, error: null }],
       "meeting_preparations:select": [{ data: { attempt_count: 0 }, error: null }],
       "meeting_preparations:upsert": [{ data: null, error: null }, { data: { id: "prep-1" }, error: null }],
+      "jobs:upsert": [{ data: { id: "material-job-1" }, error: null }],
     });
     vi.mocked(createAdminClient).mockReturnValue(client as never);
 
@@ -146,21 +144,28 @@ describe("runAutoPreparationForMeeting", () => {
     const meetingsUpdates = calls["meetings:update"] as Array<Record<string, unknown>>;
     expect(meetingsUpdates.map((u) => u.status)).toEqual(["PREPARING", "READY"]);
 
-    const agentRunUpdate = calls["agent_runs:update"][0] as Record<string, unknown>;
-    expect(agentRunUpdate.status).toBe("DONE");
+    // Two stage rows now (RESEARCH, then PREPARATION), both DONE.
+    const agentRunUpdates = calls["agent_runs:update"] as Array<Record<string, unknown>>;
+    expect(agentRunUpdates).toHaveLength(2);
+    expect(agentRunUpdates.every((u) => u.status === "DONE")).toBe(true);
 
-    const materialUpserts = calls["meeting_materials:upsert"] as Array<Record<string, unknown>>;
-    expect(materialUpserts.map((u) => u.status)).toEqual(["GENERATING", "READY"]);
+    const materialJobUpserts = calls["jobs:upsert"] as Array<Record<string, unknown>>;
+    expect(materialJobUpserts).toHaveLength(1);
+    expect(materialJobUpserts[0]).toMatchObject({ job_type: "MATERIAL_GENERATION", meeting_id: "meeting-1" });
+    expect(calls["meeting_materials:upsert"]).toBeUndefined();
   });
 
-  it("keeps the preparation READY when material generation fails", async () => {
-    vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
+  it("does not enqueue a MATERIAL_GENERATION job when generateMaterials is disabled", async () => {
+    vi.mocked(loadAutoPreparationFlag).mockResolvedValue({
+      ...enabledFlag,
+      config: { ...enabledFlag.config, generateMaterials: false },
+    });
     vi.mocked(researchClinic).mockResolvedValue({
       summary: "調査結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 },
     });
-    vi.mocked(generateStructuredJson)
-      .mockResolvedValueOnce({ rawText: validPreparationJson, usage: { inputTokens: 1, outputTokens: 1 } })
-      .mockResolvedValueOnce({ rawText: "これはJSONではありません", usage: { inputTokens: 1, outputTokens: 1 } });
+    vi.mocked(generateStructuredJson).mockResolvedValueOnce({
+      rawText: validPreparationJson, usage: { inputTokens: 1, outputTokens: 1 },
+    });
 
     const { client, calls } = makeAdminMock({
       "meetings:select": [{ data: meetingRow, error: null }],
@@ -171,19 +176,12 @@ describe("runAutoPreparationForMeeting", () => {
     });
     vi.mocked(createAdminClient).mockReturnValue(client as never);
 
-    await expect(runAutoPreparationForMeeting("meeting-1")).resolves.toBeUndefined();
+    await runAutoPreparationForMeeting("meeting-1");
 
-    const finalPrep = calls["meeting_preparations:upsert"][1] as Record<string, unknown>;
-    expect(finalPrep.status).toBe("READY");
-
-    const meetingsUpdates = calls["meetings:update"] as Array<Record<string, unknown>>;
-    expect(meetingsUpdates.map((u) => u.status)).toEqual(["PREPARING", "READY"]);
-
-    const materialUpserts = calls["meeting_materials:upsert"] as Array<Record<string, unknown>>;
-    expect(materialUpserts.map((u) => u.status)).toEqual(["GENERATING", "FAILED"]);
+    expect(calls["jobs:upsert"]).toBeUndefined();
   });
 
-  it("re-throws on a preparation (STEP B) failure so the job queue retries, and marks the agent run FAILED", async () => {
+  it("re-throws on a preparation (STEP B) failure so the job queue retries, and marks the PREPARATION agent run FAILED", async () => {
     vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
     vi.mocked(researchClinic).mockResolvedValue({
       summary: "調査結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 },
@@ -201,8 +199,29 @@ describe("runAutoPreparationForMeeting", () => {
 
     await expect(runAutoPreparationForMeeting("meeting-1")).rejects.toThrow();
 
-    const agentRunUpdate = calls["agent_runs:update"][0] as Record<string, unknown>;
-    expect(agentRunUpdate.status).toBe("FAILED");
+    // [0] = RESEARCH stage (succeeded, DONE), [1] = PREPARATION stage (failed).
+    const agentRunUpdates = calls["agent_runs:update"] as Array<Record<string, unknown>>;
+    expect(agentRunUpdates[0].status).toBe("DONE");
+    expect(agentRunUpdates[1].status).toBe("FAILED");
     expect(calls["meeting_materials:upsert"]).toBeUndefined();
+    expect(calls["jobs:upsert"]).toBeUndefined();
+  });
+
+  it("re-throws and marks the RESEARCH agent run FAILED when research itself fails", async () => {
+    vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
+    vi.mocked(researchClinic).mockRejectedValue(new Error("gemini_timeout"));
+
+    const { client, calls } = makeAdminMock({
+      "meetings:select": [{ data: meetingRow, error: null }],
+      "calendar_events:select": [{ data: eventRow, error: null }],
+      "agent_runs:insert": [{ data: { id: "agent-run-1" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await expect(runAutoPreparationForMeeting("meeting-1")).rejects.toThrow("gemini_timeout");
+
+    const agentRunUpdates = calls["agent_runs:update"] as Array<Record<string, unknown>>;
+    expect(agentRunUpdates).toHaveLength(1);
+    expect(agentRunUpdates[0].status).toBe("FAILED");
   });
 });

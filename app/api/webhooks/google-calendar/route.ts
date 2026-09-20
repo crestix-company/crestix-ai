@@ -84,8 +84,18 @@ export async function POST(request: Request) {
 
         if (result === "done") {
           try {
-            const preparation = await runDuePreparationJobs(origin);
-            console.info("calendar_webhook_preparation_jobs_processed", preparation);
+            // A successful MEETING_PREPARATION run enqueues a
+            // MATERIAL_GENERATION job as a side effect, too late to appear
+            // in the same batch this sweep already fetched. Loop a few more
+            // rounds while jobs are actually completing, so Material starts
+            // immediately instead of waiting for the next cron tick.
+            let sweep = await runDuePreparationJobs(origin);
+            let rounds = 0;
+            while (sweep.attempted > 0 && (sweep.done > 0 || sweep.retry > 0) && rounds < 5) {
+              sweep = await runDuePreparationJobs(origin);
+              rounds += 1;
+            }
+            console.info("calendar_webhook_preparation_jobs_processed", sweep);
           } catch (preparationError) {
             console.error("calendar_webhook_preparation_jobs_failed", {
               code: preparationError instanceof Error ? preparationError.message : "unknown",

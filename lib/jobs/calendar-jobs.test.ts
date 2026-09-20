@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ensureCalendarWatch, syncGoogleCalendarConnection } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
+import { runMaterialGenerationForMeeting } from "@/lib/preparation/material-generate";
 import { processCalendarJob, runDueCalendarJobs, runJobToCompletionOrBudget } from "./calendar-jobs";
 
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
@@ -13,6 +14,12 @@ vi.mock("@/lib/google/calendar-sync", () => ({
 }));
 vi.mock("@/lib/preparation/auto-generate", () => ({
   runAutoPreparationForMeeting: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/preparation/material-generate", () => ({
+  runMaterialGenerationForMeeting: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/lib/security/server-secrets", () => ({
+  getCronSecret: () => "test-cron-secret",
 }));
 
 type Canned = { data?: unknown; error?: unknown };
@@ -242,5 +249,55 @@ describe("runDueCalendarJobs - stale RUNNING recovery", () => {
       "conn-1",
       expect.objectContaining({ deadline: expect.any(Number) }),
     );
+  });
+});
+
+describe("processCalendarJob - MATERIAL_GENERATION", () => {
+  it("calls runMaterialGenerationForMeeting with the job's meeting_id and marks the job DONE", async () => {
+    const { client } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-4", job_type: "MATERIAL_GENERATION", google_connection_id: null, meeting_id: "meeting-1", status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-4" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-4", "https://example.test");
+
+    expect(result).toBe("done");
+    expect(runMaterialGenerationForMeeting).toHaveBeenCalledWith("meeting-1");
+  });
+
+  it("on final failure, marks only meeting_materials FAILED - never meeting_preparations or meetings", async () => {
+    vi.mocked(runMaterialGenerationForMeeting).mockRejectedValueOnce(new Error("gemini_material_response_invalid_schema"));
+    const { client, calls } = makeAdminMock({
+      // attempts=4 -> nextAttempts=5 = MAX_ATTEMPTS
+      "jobs:select": [{ data: { id: "job-4", job_type: "MATERIAL_GENERATION", google_connection_id: null, meeting_id: "meeting-1", status: "PENDING", attempts: 4, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-4" }, error: null }],
+      "meeting_materials:update": [{ data: null, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-4", "https://example.test");
+
+    expect(result).toBe("failed");
+    expect(calls.meeting_materials).toEqual([{
+      status: "FAILED",
+      error_safe: "gemini_material_response_invalid_schema",
+    }]);
+    expect(calls.meetings).toBeUndefined();
+    expect(calls.meeting_preparations).toBeUndefined();
+  });
+
+  it("retries with backoff before max attempts, without touching meeting_materials", async () => {
+    vi.mocked(runMaterialGenerationForMeeting).mockRejectedValueOnce(new Error("gemini_timeout"));
+    const { client, calls } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-4", job_type: "MATERIAL_GENERATION", google_connection_id: null, meeting_id: "meeting-1", status: "PENDING", attempts: 1, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-4" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-4", "https://example.test");
+
+    expect(result).toBe("retry");
+    expect(calls.meeting_materials).toBeUndefined();
   });
 });

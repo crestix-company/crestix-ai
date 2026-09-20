@@ -3,13 +3,14 @@ import "server-only";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getGeminiCredentials } from "@/lib/security/server-secrets";
 import { generateStructuredJson, researchClinic } from "@/lib/gemini/client";
+import { estimateCostUsd } from "@/lib/gemini/pricing";
 import { loadMedicalFsE1Skill } from "@/lib/skills/loader";
 import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility";
 import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
-import { buildAutoPreparationPrompt, buildMaterialPrompt, buildResearchPrompt } from "@/lib/preparation/auto-prompt";
+import { buildAutoPreparationPrompt, buildResearchPrompt } from "@/lib/preparation/auto-prompt";
 import { extractJsonObject } from "@/lib/preparation/extract-json";
 import { PreparationResultSchema, type PreparationResult } from "@/lib/preparation/schema";
-import { MaterialResultSchema } from "@/lib/preparation/material-schema";
+import { enqueueMaterialGenerationJob } from "@/lib/jobs/queue";
 
 const GEMINI_PROVIDER = "gemini";
 
@@ -64,9 +65,12 @@ function parsePreparation(rawText: string): PreparationResult {
 
 /**
  * Runs STEP A (research) -> STEP B (Skill-applied structured preparation) ->
- * saves meeting_preparations (source_mode=API) -> STEP C (internal E1
- * material). Material failure is isolated: it never reverts an already
- * READY preparation, per the auto-preparation spec.
+ * saves meeting_preparations (source_mode=API) -> enqueues STEP C
+ * (MATERIAL_GENERATION job) if enabled. Material generation is NOT run
+ * inline: it has its own independent retry lifecycle (see
+ * lib/preparation/material-generate.ts) so a Material failure never reverts
+ * an already-READY Preparation, and never re-runs (re-bills) Research or
+ * Preparation on retry.
  *
  * Re-checks eligibility itself (feature flag / meeting type / cancellation /
  * automation_start_at) rather than trusting the enqueue-time check, since
@@ -86,7 +90,6 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
 
   const { model } = getGeminiCredentials();
   const admin = createAdminClient();
-  const startedAt = new Date().toISOString();
 
   await admin.from("meetings").update({ status: "PREPARING" }).eq("id", meetingId).neq("status", "CANCELLED");
   await admin.from("meeting_preparations").upsert({
@@ -95,20 +98,22 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
     source_mode: "API",
   }, { onConflict: "meeting_id" });
 
-  const { data: agentRun } = await admin
+  const { data: researchRun } = await admin
     .from("agent_runs")
     .insert({
       meeting_id: meetingId,
       initiated_by_user_id: meeting.fs_user_id,
-      mode: "PREPARATION",
+      mode: "RESEARCH",
       provider: GEMINI_PROVIDER,
       model,
       status: "RUNNING",
       trigger_source: "GOOGLE_CALENDAR",
-      started_at: startedAt,
+      started_at: new Date().toISOString(),
     })
     .select("id")
     .single();
+
+  let preparationRun: { id: string } | null = null;
 
   try {
     const research = await researchClinic(buildResearchPrompt({
@@ -117,7 +122,39 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
       scheduledStartAt: meeting.scheduled_start_at,
     }));
 
+    if (researchRun) {
+      await admin.from("agent_runs").update({
+        status: "DONE",
+        input_tokens: research.usage.inputTokens,
+        output_tokens: research.usage.outputTokens,
+        search_call_count: research.searchCallCount,
+        estimated_cost_usd: estimateCostUsd({
+          inputTokens: research.usage.inputTokens,
+          outputTokens: research.usage.outputTokens,
+          searchCallCount: research.searchCallCount,
+        }),
+        completed_at: new Date().toISOString(),
+      }).eq("id", researchRun.id);
+    }
+
     const skill = await loadMedicalFsE1Skill();
+
+    const { data: insertedPreparationRun } = await admin
+      .from("agent_runs")
+      .insert({
+        meeting_id: meetingId,
+        initiated_by_user_id: meeting.fs_user_id,
+        skill_version_id: skill.skillVersionId,
+        mode: "PREPARATION",
+        provider: GEMINI_PROVIDER,
+        model,
+        status: "RUNNING",
+        trigger_source: "GOOGLE_CALENDAR",
+        started_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+    preparationRun = insertedPreparationRun;
 
     const generation = await generateStructuredJson(buildAutoPreparationPrompt({
       clinicName: event.title,
@@ -178,85 +215,53 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
 
     await admin.from("meetings").update({ status: "READY" }).eq("id", meetingId).neq("status", "CANCELLED");
 
-    if (agentRun) {
+    if (preparationRun) {
       await admin.from("agent_runs").update({
         status: "DONE",
-        input_tokens: research.usage.inputTokens,
+        input_tokens: generation.usage.inputTokens,
         output_tokens: generation.usage.outputTokens,
-        search_call_count: research.searchCallCount,
+        estimated_cost_usd: estimateCostUsd({
+          inputTokens: generation.usage.inputTokens,
+          outputTokens: generation.usage.outputTokens,
+          searchCallCount: null,
+        }),
         completed_at: new Date().toISOString(),
-      }).eq("id", agentRun.id);
+      }).eq("id", preparationRun.id);
     }
 
     if (flag.config.generateMaterials) {
-      await generateMaterialSafely({
-        meetingId,
-        preparationId: savedPreparation.id,
-        clinicName: event.title,
-        preparation,
-      });
+      // Independent job, independent retry lifecycle (see
+      // lib/preparation/material-generate.ts) - a Material failure must
+      // never revert this already-READY Preparation. dedupeKey changes with
+      // generated_at so a regenerated Preparation gets a fresh Material job
+      // rather than colliding with a stale one.
+      try {
+        await enqueueMaterialGenerationJob({
+          meetingId,
+          preparationId: savedPreparation.id,
+          dedupeKey: `material-gen:${meetingId}:${savedPreparation.id}:${new Date().toISOString()}`,
+        });
+      } catch (error) {
+        console.error("material_generation_job_enqueue_failed", {
+          meeting_id: meetingId,
+          code: safeErrorMessage(error),
+        });
+      }
     }
   } catch (error) {
-    if (agentRun) {
+    if (preparationRun) {
       await admin.from("agent_runs").update({
         status: "FAILED",
         error_safe: safeErrorMessage(error),
         completed_at: new Date().toISOString(),
-      }).eq("id", agentRun.id);
+      }).eq("id", preparationRun.id);
+    } else if (researchRun) {
+      await admin.from("agent_runs").update({
+        status: "FAILED",
+        error_safe: safeErrorMessage(error),
+        completed_at: new Date().toISOString(),
+      }).eq("id", researchRun.id);
     }
     throw error;
-  }
-}
-
-async function generateMaterialSafely(input: {
-  meetingId: string;
-  preparationId: string;
-  clinicName: string;
-  preparation: PreparationResult;
-}): Promise<void> {
-  const admin = createAdminClient();
-
-  try {
-    await admin.from("meeting_materials").upsert({
-      meeting_id: input.meetingId,
-      preparation_id: input.preparationId,
-      status: "GENERATING",
-    }, { onConflict: "meeting_id" });
-
-    const generation = await generateStructuredJson(buildMaterialPrompt({
-      clinicName: input.clinicName,
-      preparationJson: JSON.stringify(input.preparation),
-    }));
-
-    const parsedJson = extractJsonObject(generation.rawText);
-    if (parsedJson === null) throw new Error("gemini_material_response_not_json");
-
-    const validated = MaterialResultSchema.safeParse(parsedJson);
-    if (!validated.success) throw new Error("gemini_material_response_invalid_schema");
-
-    const material = validated.data;
-
-    await admin.from("meeting_materials").upsert({
-      meeting_id: input.meetingId,
-      preparation_id: input.preparationId,
-      status: "READY",
-      title: material.title,
-      executive_summary: material.executive_summary,
-      slides: material.slides,
-      document_markdown: material.document_markdown,
-      error_safe: null,
-      generated_at: new Date().toISOString(),
-    }, { onConflict: "meeting_id" });
-  } catch (error) {
-    console.error("meeting_material_generation_failed", {
-      meeting_id: input.meetingId,
-      code: safeErrorMessage(error),
-    });
-    await admin.from("meeting_materials").upsert({
-      meeting_id: input.meetingId,
-      preparation_id: input.preparationId,
-      status: "FAILED",
-      error_safe: safeErrorMessage(error),
-    }, { onConflict: "meeting_id" });
   }
 }

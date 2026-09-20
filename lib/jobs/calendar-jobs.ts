@@ -9,12 +9,17 @@ import {
   SYNC_TIME_BUDGET_MS,
 } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
+import { runMaterialGenerationForMeeting } from "@/lib/preparation/material-generate";
 import { getCronSecret } from "@/lib/security/server-secrets";
 
-export { enqueueCalendarSyncJob, enqueueMeetingPreparationJob } from "@/lib/jobs/queue";
+export {
+  enqueueCalendarSyncJob,
+  enqueueMeetingPreparationJob,
+  enqueueMaterialGenerationJob,
+} from "@/lib/jobs/queue";
 
 const MAX_ATTEMPTS = 5;
-const PREPARATION_JOB_TYPES = ["MEETING_PREPARATION"] as const;
+const PREPARATION_JOB_TYPES = ["MEETING_PREPARATION", "MATERIAL_GENERATION"] as const;
 const CALENDAR_JOB_TYPES = ["CALENDAR_SYNC", "WATCH_RENEWAL"] as const;
 const STALE_RUNNING_THRESHOLD_MS = 5 * 60 * 1000;
 /**
@@ -53,6 +58,24 @@ async function markPreparationFailed(meetingId: string): Promise<void> {
     await admin.from("meetings").update({ status: "FAILED" }).eq("id", meetingId).neq("status", "CANCELLED");
   } catch (error) {
     console.error("meeting_preparation_failure_flag_failed", {
+      meeting_id: meetingId,
+      code: safeCalendarErrorCode(error),
+    });
+  }
+}
+
+/**
+ * Unlike markPreparationFailed, this never touches meeting_preparations or
+ * meetings: a Material failure must not revert an already-READY
+ * Preparation or the meeting's READY status (per the auto-preparation
+ * hardening spec) - only meeting_materials reflects the failure.
+ */
+async function markMaterialFailed(meetingId: string, errorSafe: string): Promise<void> {
+  const admin = createAdminClient();
+  try {
+    await admin.from("meeting_materials").update({ status: "FAILED", error_safe: errorSafe }).eq("meeting_id", meetingId);
+  } catch (error) {
+    console.error("meeting_material_failure_flag_failed", {
       meeting_id: meetingId,
       code: safeCalendarErrorCode(error),
     });
@@ -157,6 +180,9 @@ export async function processCalendarJob(
     } else if (pending.job_type === "MEETING_PREPARATION") {
       if (!pending.meeting_id) throw new Error("meeting_preparation_job_meeting_missing");
       await runAutoPreparationForMeeting(pending.meeting_id);
+    } else if (pending.job_type === "MATERIAL_GENERATION") {
+      if (!pending.meeting_id) throw new Error("material_generation_job_meeting_missing");
+      await runMaterialGenerationForMeeting(pending.meeting_id);
     } else {
       throw new Error("unsupported_job_type");
     }
@@ -185,6 +211,8 @@ export async function processCalendarJob(
 
       if (pending.job_type === "MEETING_PREPARATION" && pending.meeting_id) {
         await markPreparationFailed(pending.meeting_id);
+      } else if (pending.job_type === "MATERIAL_GENERATION" && pending.meeting_id) {
+        await markMaterialFailed(pending.meeting_id, safeError);
       }
 
       return "failed";
@@ -302,7 +330,7 @@ async function runDueJobsOfTypes(
   return { attempted: data?.length ?? 0, done, retry, failed, continuing };
 }
 
-/** Cron fallback - recovers CALENDAR_SYNC/WATCH_RENEWAL/MEETING_PREPARATION jobs left PENDING after a failed webhook-triggered attempt. */
+/** Cron fallback - recovers CALENDAR_SYNC/WATCH_RENEWAL/MEETING_PREPARATION/MATERIAL_GENERATION jobs left PENDING after a failed webhook-triggered attempt. */
 export async function runDueCalendarJobs(
   appOrigin: string,
   limit = 10,
