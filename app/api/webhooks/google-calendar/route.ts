@@ -51,7 +51,7 @@ export async function POST(request: Request) {
     .eq("id", channel.id);
 
   const dedupeKey = `gcal:${notification.channelId}:${notification.messageNumber}`;
-  const jobId = await enqueueCalendarSyncJob({
+  let jobId = await enqueueCalendarSyncJob({
     connectionId: channel.google_connection_id,
     dedupeKey,
     payload: {
@@ -60,6 +60,24 @@ export async function POST(request: Request) {
       message_number: notification.messageNumber,
     },
   });
+
+  if (!jobId) {
+    // Coalesced: an active CALENDAR_SYNC job already exists for this
+    // connection (at most one active job per connection - see the job
+    // coalescing migration). last_message_number is already captured above
+    // regardless, but don't waste this webhook delivery doing nothing -
+    // give the existing job a chance to make progress too.
+    const { data: activeJob } = await admin
+      .from("jobs")
+      .select("id")
+      .eq("job_type", "CALENDAR_SYNC")
+      .eq("google_connection_id", channel.google_connection_id)
+      .in("status", ["PENDING", "RUNNING"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    jobId = activeJob?.id ?? null;
+  }
 
   if (jobId) {
     let appOrigin: string | null = null;
