@@ -343,6 +343,53 @@ describe("runJobToCompletionOrBudget - self-continuation", () => {
     );
   });
 
+  it("targets the stable production domain, not the request-derived appOrigin (regression: confirmed live that a cron-triggered invocation's appOrigin resolves to the unique per-deployment URL, which is gated by Vercel Deployment Protection and silently 401s any self-fetch built from it)", async () => {
+    vi.stubEnv("VERCEL_PROJECT_PRODUCTION_URL", "crestix-ai.vercel.app");
+    vi.mocked(syncGoogleCalendarConnection).mockResolvedValue({ eventCount: 10, syncTokenStored: false, completed: false });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { client } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-5b", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-5b" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    // Simulates the exact bug: appOrigin here is the protected per-deployment
+    // URL a real cron request would resolve to, NOT the stable alias.
+    await runJobToCompletionOrBudget("job-5b", "https://crestix-abc123-team.vercel.app", Date.now() - 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://crestix-ai.vercel.app/api/internal/calendar-sync-continue",
+      expect.anything(),
+    );
+
+    vi.unstubAllEnvs();
+  });
+
+  it("logs (does not silently drop) a non-2xx response from the continuation target", async () => {
+    vi.mocked(syncGoogleCalendarConnection).mockResolvedValue({ eventCount: 10, syncTokenStored: false, completed: false });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { client } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-5c", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-5c" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await runJobToCompletionOrBudget("job-5c", "https://example.test", Date.now() - 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "calendar_sync_continuation_trigger_non_ok",
+      expect.objectContaining({ job_id: "job-5c", status: 401 }),
+    );
+    errorSpy.mockRestore();
+  });
+
   it("does not self-trigger once the job actually completes within the budget", async () => {
     vi.mocked(syncGoogleCalendarConnection).mockResolvedValue({ eventCount: 5, syncTokenStored: true, completed: true });
     const fetchMock = vi.fn();

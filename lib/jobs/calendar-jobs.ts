@@ -1,6 +1,7 @@
 import "server-only";
 
 import { after } from "next/server";
+import { resolveStableOrigin } from "@/lib/auth/app-origin";
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
   ensureCalendarWatch,
@@ -254,13 +255,22 @@ function triggerCalendarSyncContinuation(jobId: string, appOrigin: string): void
     after(async () => {
       try {
         const secret = getCronSecret();
-        const url = new URL("/api/internal/calendar-sync-continue", appOrigin).toString();
-        await fetch(url, {
+        const url = new URL("/api/internal/calendar-sync-continue", resolveStableOrigin(appOrigin)).toString();
+        const response = await fetch(url, {
           method: "POST",
           headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
           body: JSON.stringify({ jobId }),
           signal: AbortSignal.timeout(5_000),
         });
+        if (!response.ok) {
+          // fetch() only throws on network-level failure, never on a
+          // non-2xx HTTP response - a protected/blocked/misrouted target
+          // must still be loud, not fail silently like this did before.
+          console.error("calendar_sync_continuation_trigger_non_ok", {
+            job_id: jobId,
+            status: response.status,
+          });
+        }
       } catch (error) {
         console.error("calendar_sync_continuation_trigger_failed", {
           job_id: jobId,

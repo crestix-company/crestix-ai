@@ -140,4 +140,24 @@ describe("ensureCalendarWatch", () => {
     }));
     expect(listCalendarEventsPage).not.toHaveBeenCalled();
   });
+
+  it("registers the webhook against the stable production domain, never the request-derived appOrigin (regression: cron-triggered renewals resolve appOrigin to a Deployment-Protection-gated per-deployment URL, which silently breaks Google's real webhook deliveries with 401s)", async () => {
+    vi.stubEnv("VERCEL_PROJECT_PRODUCTION_URL", "crestix-ai.vercel.app");
+    vi.mocked(createAdminClient).mockReturnValue(makeAdminMock({
+      "google_connections:select": { data: connectionRow },
+      "organization_memberships:select": { data: membershipRow },
+      "calendar_watch_channels:select": { data: null },
+      "calendar_watch_channels:insert": { data: { id: "watch-new" } },
+    }) as never);
+
+    // Simulates exactly the bug scenario: a cron-triggered call whose own
+    // request resolved to the protected per-deployment URL, not the alias.
+    await ensureCalendarWatch("conn-1", "https://crestix-abc123-team.vercel.app", { accessToken: "token-x" });
+
+    expect(watchCalendarEvents).toHaveBeenCalledWith(expect.objectContaining({
+      webhookUrl: "https://crestix-ai.vercel.app/api/webhooks/google-calendar",
+    }));
+
+    vi.unstubAllEnvs();
+  });
 });

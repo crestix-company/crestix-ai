@@ -1,6 +1,7 @@
 import "server-only";
 
 import { randomBytes, randomUUID } from "node:crypto";
+import { resolveStableOrigin } from "@/lib/auth/app-origin";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { decryptRefreshToken } from "@/lib/security/token-encryption";
 import { getTokenEncryptionKey } from "@/lib/security/server-secrets";
@@ -459,7 +460,13 @@ export async function ensureCalendarWatch(
   const channelId = randomUUID();
   const channelToken = randomBytes(32).toString("base64url");
   const tokenHash = hashCalendarChannelToken(channelToken);
-  const webhookUrl = new URL("/api/webhooks/google-calendar", appOrigin).toString();
+  // Must be the stable production domain, never the request-derived
+  // appOrigin: a cron-triggered renewal's request resolves to the unique
+  // per-deployment URL, which - unlike the production alias - is gated by
+  // Vercel's Deployment Protection. A webhook registered against that URL
+  // would make Google's real notifications start failing with silent 401s
+  // after the next renewal cycle. See resolveStableOrigin's docstring.
+  const webhookUrl = new URL("/api/webhooks/google-calendar", resolveStableOrigin(appOrigin)).toString();
 
   const watchResponse = await watchCalendarEvents({
     accessToken,
