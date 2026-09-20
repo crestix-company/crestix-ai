@@ -243,25 +243,37 @@ export async function processCalendarJob(
  * even though nothing awaits its response. Gated by the same CRON_SECRET
  * used for the cron route - a trusted server-to-server trigger, not a
  * user-facing credential, and never logged.
+ *
+ * after() itself throws synchronously if called outside a real request
+ * execution context - this must never propagate out of here and corrupt an
+ * otherwise-successful job-processing result, so the call to after() is
+ * itself guarded, not just the work inside it.
  */
 function triggerCalendarSyncContinuation(jobId: string, appOrigin: string): void {
-  after(async () => {
-    try {
-      const secret = getCronSecret();
-      const url = new URL("/api/internal/calendar-sync-continue", appOrigin).toString();
-      await fetch(url, {
-        method: "POST",
-        headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
-        body: JSON.stringify({ jobId }),
-        signal: AbortSignal.timeout(5_000),
-      });
-    } catch (error) {
-      console.error("calendar_sync_continuation_trigger_failed", {
-        job_id: jobId,
-        code: safeCalendarErrorCode(error),
-      });
-    }
-  });
+  try {
+    after(async () => {
+      try {
+        const secret = getCronSecret();
+        const url = new URL("/api/internal/calendar-sync-continue", appOrigin).toString();
+        await fetch(url, {
+          method: "POST",
+          headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+          body: JSON.stringify({ jobId }),
+          signal: AbortSignal.timeout(5_000),
+        });
+      } catch (error) {
+        console.error("calendar_sync_continuation_trigger_failed", {
+          job_id: jobId,
+          code: safeCalendarErrorCode(error),
+        });
+      }
+    });
+  } catch (error) {
+    console.error("calendar_sync_continuation_schedule_failed", {
+      job_id: jobId,
+      code: safeCalendarErrorCode(error),
+    });
+  }
 }
 
 /**

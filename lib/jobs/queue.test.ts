@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { enqueueMeetingPreparationJob } from "./queue";
+import { enqueueMaterialGenerationJob, enqueueMeetingPreparationJob } from "./queue";
 
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
 
@@ -65,5 +65,55 @@ describe("enqueueMeetingPreparationJob", () => {
       meetingId: "meeting-1",
       dedupeKey: "meeting-prep:meeting-1:abc123",
     })).rejects.toThrow("meeting_preparation_job_enqueue_failed");
+  });
+});
+
+describe("enqueueMaterialGenerationJob", () => {
+  it("upserts a MATERIAL_GENERATION job carrying preparation_id in payload, keyed by its own dedupe key", async () => {
+    const { client, upsertCalls } = makeAdminMock({ data: { id: "job-2" }, error: null });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const jobId = await enqueueMaterialGenerationJob({
+      meetingId: "meeting-1",
+      preparationId: "prep-1",
+      dedupeKey: "material-gen:meeting-1:prep-1:2026-09-20T00:00:00.000Z",
+    });
+
+    expect(jobId).toBe("job-2");
+    expect(upsertCalls[0].payload).toMatchObject({
+      job_type: "MATERIAL_GENERATION",
+      meeting_id: "meeting-1",
+      payload: { preparation_id: "prep-1" },
+      dedupe_key: "material-gen:meeting-1:prep-1:2026-09-20T00:00:00.000Z",
+      status: "PENDING",
+    });
+    expect(upsertCalls[0].options).toMatchObject({
+      onConflict: "dedupe_key",
+      ignoreDuplicates: true,
+    });
+  });
+
+  it("returns null without throwing when the dedupe key already exists (regenerating the same preparation version doesn't pile up jobs)", async () => {
+    const { client } = makeAdminMock({ data: null, error: null });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const jobId = await enqueueMaterialGenerationJob({
+      meetingId: "meeting-1",
+      preparationId: "prep-1",
+      dedupeKey: "material-gen:meeting-1:prep-1:2026-09-20T00:00:00.000Z",
+    });
+
+    expect(jobId).toBeNull();
+  });
+
+  it("throws on a real database error other than a duplicate-key conflict", async () => {
+    const { client } = makeAdminMock({ data: null, error: { code: "42501" } });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await expect(enqueueMaterialGenerationJob({
+      meetingId: "meeting-1",
+      preparationId: "prep-1",
+      dedupeKey: "material-gen:meeting-1:prep-1:2026-09-20T00:00:00.000Z",
+    })).rejects.toThrow("material_generation_job_enqueue_failed");
   });
 });

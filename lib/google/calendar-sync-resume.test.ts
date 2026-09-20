@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { listCalendarEventsPage } from "@/lib/google/calendar-api";
+import { GoogleCalendarApiError, listCalendarEventsPage } from "@/lib/google/calendar-api";
 import { syncGoogleCalendarConnection } from "./calendar-sync";
 
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
 vi.mock("@/lib/google/calendar-api", () => ({
-  GoogleCalendarApiError: class GoogleCalendarApiError extends Error {},
+  GoogleCalendarApiError: class GoogleCalendarApiError extends Error {
+    constructor(readonly operation: string, readonly status: number) {
+      super(`mock_google_calendar_api_error:${operation}:${status}`);
+    }
+  },
   listCalendarEventsPage: vi.fn(),
   refreshGoogleAccessToken: vi.fn(),
   stopCalendarWatch: vi.fn(),
@@ -159,5 +163,88 @@ describe("syncGoogleCalendarConnection - page resume", () => {
       pageToken: "resume-token",
       initialTimeMin: null,
     });
+  });
+});
+
+describe("syncGoogleCalendarConnection - 410 Gone recovery", () => {
+  it("discards the stale sync_token/pending_page_token and falls back to a fresh bounded initial sync (not another syncToken attempt)", async () => {
+    vi.mocked(listCalendarEventsPage)
+      .mockRejectedValueOnce(new GoogleCalendarApiError("events_list", 410))
+      .mockResolvedValueOnce({ items: [nonMatchingEvent], nextSyncToken: "fresh-sync-token" });
+
+    const { client, watchUpdateCalls } = makeAdminMock({
+      "google_connections:select": [{ data: connectionRow, error: null }],
+      "organization_memberships:select": [{ data: membershipRow, error: null }],
+      // Two entries: the initial lookup (before recovery) sees the stale
+      // sync_token; the recursive retry's re-fetch (by watchId, after the
+      // recovery update below has run) sees it cleared - the mock doesn't
+      // model real DB mutation, so this models the post-update read directly.
+      "calendar_watch_channels:select": [
+        {
+          data: {
+            id: "watch-1", channel_id: "c1", resource_id: "r1",
+            sync_token: "stale-sync-token", pending_page_token: null,
+            expiration_at: new Date(Date.now() + 999999).toISOString(), status: "ACTIVE",
+          },
+          error: null,
+        },
+        {
+          data: {
+            id: "watch-1", channel_id: "c1", resource_id: "r1",
+            sync_token: null, pending_page_token: null,
+            expiration_at: new Date(Date.now() + 999999).toISOString(), status: "ACTIVE",
+          },
+          error: null,
+        },
+      ],
+      "calendar_events:select": [{ data: null, error: null }],
+      "calendar_events:upsert": [{ data: { id: "event-row-1" }, error: null }],
+      "meetings:select": [{ data: null, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await syncGoogleCalendarConnection("conn-1", { accessToken: "token-x" });
+
+    expect(result).toEqual({ eventCount: 1, syncTokenStored: true, completed: true });
+    expect(listCalendarEventsPage).toHaveBeenCalledTimes(2);
+
+    // First attempt used the (now-stale) syncToken.
+    expect(vi.mocked(listCalendarEventsPage).mock.calls[0][0]).toMatchObject({ syncToken: "stale-sync-token" });
+
+    // Recovery clears sync_token/pending_page_token before retrying.
+    expect(watchUpdateCalls[0]).toMatchObject({ sync_token: null, pending_page_token: null });
+
+    // The retry is a fresh BOUNDED initial query (both timeMin and timeMax
+    // set), not another syncToken attempt and not an unbounded one.
+    const retryCall = vi.mocked(listCalendarEventsPage).mock.calls[1][0] as {
+      syncToken?: string | null;
+      initialTimeMin?: string | null;
+      initialTimeMax?: string | null;
+    };
+    expect(retryCall.syncToken).toBeFalsy();
+    expect(retryCall.initialTimeMin).toBeTruthy();
+    expect(retryCall.initialTimeMax).toBeTruthy();
+  });
+
+  it("propagates a second consecutive 410 instead of retrying forever", async () => {
+    vi.mocked(listCalendarEventsPage).mockRejectedValue(new GoogleCalendarApiError("events_list", 410));
+
+    const { client } = makeAdminMock({
+      "google_connections:select": [{ data: connectionRow, error: null }],
+      "organization_memberships:select": [{ data: membershipRow, error: null }],
+      "calendar_watch_channels:select": [{
+        data: {
+          id: "watch-1", channel_id: "c1", resource_id: "r1",
+          sync_token: "stale-sync-token", pending_page_token: null,
+          expiration_at: new Date(Date.now() + 999999).toISOString(), status: "ACTIVE",
+        },
+        error: null,
+      }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await expect(syncGoogleCalendarConnection("conn-1", { accessToken: "token-x" })).rejects.toThrow();
+    // Exactly one retry attempt (retriedAfterGone guards against looping).
+    expect(listCalendarEventsPage).toHaveBeenCalledTimes(2);
   });
 });

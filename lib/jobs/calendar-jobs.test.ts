@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ensureCalendarWatch, syncGoogleCalendarConnection } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
@@ -20,6 +20,14 @@ vi.mock("@/lib/preparation/material-generate", () => ({
 }));
 vi.mock("@/lib/security/server-secrets", () => ({
   getCronSecret: () => "test-cron-secret",
+}));
+// Vitest has no real Next.js request-execution context, so the genuine
+// after() throws synchronously ("called outside a request scope"). Mocked
+// to run its callback inline so tests can assert what gets scheduled
+// (URL/headers/body) - the real after()'s own delivery semantics are a
+// Next.js/Vercel runtime concern, not something a unit test should model.
+vi.mock("next/server", () => ({
+  after: (callback: () => void | Promise<void>) => { void callback(); },
 }));
 
 type Canned = { data?: unknown; error?: unknown };
@@ -299,5 +307,83 @@ describe("processCalendarJob - MATERIAL_GENERATION", () => {
 
     expect(result).toBe("retry");
     expect(calls.meeting_materials).toBeUndefined();
+  });
+});
+
+describe("runJobToCompletionOrBudget - self-continuation", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("fires a background self-request to the internal continuation route when the job still isn't done at the deadline", async () => {
+    vi.mocked(syncGoogleCalendarConnection).mockResolvedValue({ eventCount: 10, syncTokenStored: false, completed: false });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { client } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-5", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-5" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const pastDeadline = Date.now() - 1;
+    const result = await runJobToCompletionOrBudget("job-5", "https://example.test", pastDeadline);
+
+    expect(result).toBe("continuing");
+    // after() runs its callback once the current tick finishes - flush it.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://example.test/api/internal/calendar-sync-continue",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ authorization: "Bearer test-cron-secret" }),
+        body: JSON.stringify({ jobId: "job-5" }),
+      }),
+    );
+  });
+
+  it("does not self-trigger once the job actually completes within the budget", async () => {
+    vi.mocked(syncGoogleCalendarConnection).mockResolvedValue({ eventCount: 5, syncTokenStored: true, completed: true });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { client } = makeAdminMock({
+      "jobs:select": [{ data: { id: "job-6", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null, status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-6" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await runJobToCompletionOrBudget("job-6", "https://example.test", Date.now() + 45_000);
+
+    expect(result).toBe("done");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("processCalendarJob - CALENDAR_SYNC continuation safety cap", () => {
+  it("fails a job that has checkpointed past MAX_SYNC_CONTINUATIONS instead of self-triggering forever", async () => {
+    vi.mocked(syncGoogleCalendarConnection).mockResolvedValueOnce({ eventCount: 1, syncTokenStored: false, completed: false });
+    const { client, calls } = makeAdminMock({
+      "jobs:select": [{
+        data: {
+          id: "job-7", job_type: "CALENDAR_SYNC", google_connection_id: "conn-1", meeting_id: null,
+          status: "PENDING", attempts: 3, run_after: new Date(0).toISOString(),
+          payload: { continuation_count: 200 },
+        },
+      }],
+      "jobs:update": [{ data: { id: "job-7" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-7", "https://example.test");
+
+    expect(result).toBe("failed");
+    const finalUpdate = calls.jobs[calls.jobs.length - 1] as Record<string, unknown>;
+    expect(finalUpdate).toMatchObject({
+      status: "FAILED",
+      last_error_safe: "calendar_sync_continuation_limit_exceeded",
+    });
   });
 });

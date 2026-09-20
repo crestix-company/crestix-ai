@@ -1,13 +1,23 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { AppShell } from "@/components/app-shell";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { requireAuthorizedUser } from "@/lib/auth/authorization";
 import { createClient } from "@/lib/supabase/server";
 import type { MaterialSlide } from "@/lib/preparation/material-schema";
 import { CopyTextButton } from "../copy-text-button";
+import { retryMaterialGeneration } from "./actions";
 
 export const dynamic = "force-dynamic";
+
+const RETRY_STATUS_MESSAGES: Record<string, string> = {
+  retry_started: "資料の再生成を開始しました。",
+  retry_queued: "資料の再生成を予約しました。まもなく開始されます。",
+  already_in_progress: "既に資料生成が進行中です。",
+  preparation_not_ready: "事前準備が完了していないため、資料を再生成できません。",
+  retry_failed: "資料の再生成を開始できませんでした。時間をおいて再度お試しください。",
+};
 
 function relation<T>(value: T | T[] | null): T | null {
   if (Array.isArray(value)) return value[0] ?? null;
@@ -32,11 +42,14 @@ const STATUS_LABELS: Record<string, string> = {
 
 export default async function MeetingMaterialPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ status?: string }>;
 }) {
   const user = await requireAuthorizedUser();
   const { id } = await params;
+  const { status } = await searchParams;
   const supabase = await createClient();
 
   const { data: meeting, error: meetingError } = await supabase
@@ -65,6 +78,12 @@ export default async function MeetingMaterialPage({
         商談詳細に戻る
       </Link>
 
+      {status && RETRY_STATUS_MESSAGES[status] ? (
+        <p className="mt-4 rounded-md border border-border bg-muted px-4 py-2 text-sm">
+          {RETRY_STATUS_MESSAGES[status]}
+        </p>
+      ) : null}
+
       <Card className="mt-6">
         <CardHeader>
           <h2 className="font-semibold">資料生成状態</h2>
@@ -78,9 +97,14 @@ export default async function MeetingMaterialPage({
             </p>
           ) : null}
           {material?.status === "FAILED" ? (
-            <p className="text-muted-foreground">
-              資料生成に失敗しました。事前準備自体は保存済みの場合があります。商談詳細で確認してください。
-            </p>
+            <div className="space-y-3">
+              <p className="text-muted-foreground">
+                資料生成に失敗しました。事前準備自体は保存済みのため、商談詳細から内容を確認できます。
+              </p>
+              <form action={retryMaterialGeneration.bind(null, id)}>
+                <Button type="submit" variant="secondary">資料を再生成</Button>
+              </form>
+            </div>
           ) : null}
         </CardContent>
       </Card>
