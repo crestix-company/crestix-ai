@@ -1,5 +1,6 @@
 import "server-only";
 
+import { after } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
   ensureCalendarWatch,
@@ -8,6 +9,7 @@ import {
   SYNC_TIME_BUDGET_MS,
 } from "@/lib/google/calendar-sync";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
+import { getCronSecret } from "@/lib/security/server-secrets";
 
 export { enqueueCalendarSyncJob, enqueueMeetingPreparationJob } from "@/lib/jobs/queue";
 
@@ -15,6 +17,15 @@ const MAX_ATTEMPTS = 5;
 const PREPARATION_JOB_TYPES = ["MEETING_PREPARATION"] as const;
 const CALENDAR_JOB_TYPES = ["CALENDAR_SYNC", "WATCH_RENEWAL"] as const;
 const STALE_RUNNING_THRESHOLD_MS = 5 * 60 * 1000;
+/**
+ * Safety cap on self-triggered checkpoint continuations for a single
+ * CALENDAR_SYNC job (see triggerCalendarSyncContinuation). Each continuation
+ * is a full ~45s time-budget cycle, so 200 is a generous ~2.5h ceiling for a
+ * one-time large initial backfill - well beyond what any real backfill
+ * should need - while still guaranteeing a broken/looping sync can't
+ * self-trigger forever and run up compute cost unnoticed.
+ */
+const MAX_SYNC_CONTINUATIONS = 200;
 
 /**
  * A job stays RUNNING once claimed until its own try/catch writes DONE/
@@ -70,7 +81,7 @@ export async function processCalendarJob(
 
   const { data: pending, error: lookupError } = await admin
     .from("jobs")
-    .select("id,job_type,google_connection_id,meeting_id,status,attempts,run_after")
+    .select("id,job_type,google_connection_id,meeting_id,status,attempts,run_after,payload")
     .eq("id", jobId)
     .maybeSingle();
 
@@ -105,8 +116,27 @@ export async function processCalendarJob(
          * attempts back to its pre-claim value means paging through a large
          * backfill never counts against MAX_ATTEMPTS - only genuine errors
          * (thrown from the sync itself) do. run_after is "now" so the next
-         * sweep or webhook-triggered call can continue immediately.
+         * sweep, webhook-triggered call, or self-continuation (see
+         * runJobToCompletionOrBudget) can continue immediately.
          */
+        const existingPayload = (pending.payload ?? {}) as Record<string, unknown>;
+        const continuationCount = (typeof existingPayload["continuation_count"] === "number"
+          ? existingPayload["continuation_count"]
+          : 0) + 1;
+
+        if (continuationCount > MAX_SYNC_CONTINUATIONS) {
+          await admin
+            .from("jobs")
+            .update({
+              status: "FAILED",
+              locked_at: null,
+              last_error_safe: "calendar_sync_continuation_limit_exceeded",
+            })
+            .eq("id", jobId);
+
+          return "failed";
+        }
+
         await admin
           .from("jobs")
           .update({
@@ -115,6 +145,7 @@ export async function processCalendarJob(
             locked_at: null,
             last_error_safe: null,
             run_after: new Date().toISOString(),
+            payload: { ...existingPayload, continuation_count: continuationCount },
           })
           .eq("id", jobId);
 
@@ -175,12 +206,46 @@ export async function processCalendarJob(
 }
 
 /**
+ * Fires a background HTTP call back into this same deployment to resume a
+ * checkpointed CALENDAR_SYNC job, so draining a large initial backfill
+ * doesn't depend on a human re-editing the Calendar event or waiting for the
+ * next cron tick. Wrapped in after() since it's invoked from inside a
+ * request's execution (webhook, cron, or the continuation route itself);
+ * after() keeps the invocation alive long enough for the fetch to be sent
+ * even though nothing awaits its response. Gated by the same CRON_SECRET
+ * used for the cron route - a trusted server-to-server trigger, not a
+ * user-facing credential, and never logged.
+ */
+function triggerCalendarSyncContinuation(jobId: string, appOrigin: string): void {
+  after(async () => {
+    try {
+      const secret = getCronSecret();
+      const url = new URL("/api/internal/calendar-sync-continue", appOrigin).toString();
+      await fetch(url, {
+        method: "POST",
+        headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+        body: JSON.stringify({ jobId }),
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch (error) {
+      console.error("calendar_sync_continuation_trigger_failed", {
+        job_id: jobId,
+        code: safeCalendarErrorCode(error),
+      });
+    }
+  });
+}
+
+/**
  * Keeps re-invoking processCalendarJob for the same job while it reports
  * "continuing" (a graceful time-budget checkpoint, not a failure), sharing
  * one deadline across every round so the loop itself never runs the job
  * past the true remaining budget. Used by both the sweep below and the
  * webhook route, so a large CALENDAR_SYNC backfill makes as much durable
- * progress as fits in one invocation instead of stopping after one page.
+ * progress as fits in one invocation instead of stopping after one page. If
+ * the job still isn't done once the shared deadline is reached, triggers a
+ * self-continuation so a fresh invocation picks up where this one left off
+ * without needing another external event.
  */
 export async function runJobToCompletionOrBudget(
   jobId: string,
@@ -190,6 +255,9 @@ export async function runJobToCompletionOrBudget(
   let result = await processCalendarJob(jobId, appOrigin, deadline);
   while (result === "continuing" && Date.now() < deadline) {
     result = await processCalendarJob(jobId, appOrigin, deadline);
+  }
+  if (result === "continuing") {
+    triggerCalendarSyncContinuation(jobId, appOrigin);
   }
   return result;
 }
