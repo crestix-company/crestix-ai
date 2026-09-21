@@ -1,7 +1,14 @@
 import "server-only";
 
 import { timingSafeEqual } from "node:crypto";
-import { getCronSecret } from "@/lib/security/server-secrets";
+import { getCronSecret, getSupabaseCronBridgeSecret } from "@/lib/security/server-secrets";
+
+function isValidBearerToken(header: string | null, secret: string): boolean {
+  const supplied = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(secret);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 /**
  * Shared by the cron route and the internal job-continuation route: both are
@@ -16,9 +23,21 @@ export function isValidInternalBearerToken(header: string | null): boolean {
   } catch {
     return false;
   }
+  return isValidBearerToken(header, secret);
+}
 
-  const supplied = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(secret);
-  return a.length === b.length && timingSafeEqual(a, b);
+/**
+ * Gates /api/cron/jobs, called by Supabase's pg_cron + pg_net (not Vercel
+ * Cron - see getSupabaseCronBridgeSecret's docstring) every few minutes to
+ * sweep due MEETING_PREPARATION/MATERIAL_GENERATION jobs without needing a
+ * human to manually nudge a stalled retry.
+ */
+export function isValidSupabaseCronBridgeToken(header: string | null): boolean {
+  let secret: string;
+  try {
+    secret = getSupabaseCronBridgeSecret();
+  } catch {
+    return false;
+  }
+  return isValidBearerToken(header, secret);
 }

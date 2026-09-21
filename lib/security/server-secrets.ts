@@ -32,6 +32,23 @@ export function getCronSecret(): string {
   return secret;
 }
 
+/**
+ * Separate from CRON_SECRET (which authenticates Vercel's own once-daily
+ * Hobby-plan cron and this app's self-continuation calls). Hobby plans
+ * cannot run a Vercel Cron more often than once per day, so delayed job
+ * retries (Gemini 503 backoff etc.) need a different trigger: Supabase's
+ * own pg_cron + pg_net call /api/cron/jobs every few minutes, entirely
+ * within the already-provisioned Supabase project (no new paid service).
+ * This secret is generated inside Postgres itself (encode(gen_random_
+ * bytes(32),'hex')) and stored in Supabase Vault - see the phase3_job_
+ * bridge_cron migration - never typed or guessed by a human/agent.
+ */
+export function getSupabaseCronBridgeSecret(): string {
+  const secret = process.env["SUPABASE_CRON_BRIDGE_SECRET"];
+  if (!secret) throw new Error("SUPABASE_CRON_BRIDGE_SECRET is missing");
+  return secret;
+}
+
 export type GeminiStage = "research" | "generation";
 
 /**
