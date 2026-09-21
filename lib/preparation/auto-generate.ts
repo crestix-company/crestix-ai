@@ -9,6 +9,7 @@ import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility
 import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
 import { buildAutoPreparationPrompt, buildDegradedResearchPrompt, buildResearchPrompt } from "@/lib/preparation/auto-prompt";
 import { extractJsonObject } from "@/lib/preparation/extract-json";
+import { sanitizeIsHandoff, type RawIsHandoff } from "@/lib/preparation/is-handoff";
 import { PreparationResultSchema, type PreparationResult } from "@/lib/preparation/schema";
 import { enqueueMaterialGenerationJob } from "@/lib/jobs/queue";
 
@@ -21,6 +22,8 @@ interface MeetingRow {
   scheduled_start_at: string | null;
   fs_user_id: string;
   calendar_event_id: string;
+  clinic_name: string | null;
+  is_handoff: RawIsHandoff | null;
 }
 
 interface CalendarEventRow {
@@ -60,7 +63,7 @@ async function loadMeetingContext(meetingId: string): Promise<{ meeting: Meeting
 
   const { data: meeting, error: meetingError } = await admin
     .from("meetings")
-    .select("id,meeting_type,status,scheduled_start_at,fs_user_id,calendar_event_id")
+    .select("id,meeting_type,status,scheduled_start_at,fs_user_id,calendar_event_id,clinic_name,is_handoff")
     .eq("id", meetingId)
     .maybeSingle();
   if (meetingError || !meeting) throw new Error("meeting_preparation_meeting_missing");
@@ -102,16 +105,11 @@ function parsePreparation(rawText: string): PreparationResult {
  * the underlying Calendar event hasn't changed since (research_source_
  * updated_at pinned to calendar_events.source_updated_at).
  *
- * jobAttempts (the job's post-claim attempt count) is threaded down into
- * the generation-stage Gemini calls so a persistently-failing run can fall
- * back to an alternate model after enough attempts (see
- * getGeminiCredentials's GENERATION_FALLBACK_AFTER_ATTEMPTS).
- *
  * Re-checks eligibility itself (feature flag / meeting type / cancellation /
  * automation_start_at) rather than trusting the enqueue-time check, since
  * time may have passed between enqueue and a retried run.
  */
-export async function runAutoPreparationForMeeting(meetingId: string, jobAttempts = 0): Promise<void> {
+export async function runAutoPreparationForMeeting(meetingId: string): Promise<void> {
   const { meeting, event } = await loadMeetingContext(meetingId);
 
   const flag = await loadAutoPreparationFlag(meeting.fs_user_id);
@@ -124,6 +122,13 @@ export async function runAutoPreparationForMeeting(meetingId: string, jobAttempt
   if (!eligible || !flag) return;
 
   const admin = createAdminClient();
+
+  // clinic_name/is_handoff are computed once at Calendar Sync time (see
+  // lib/google/calendar-sync.ts) and persisted on the meeting row - reused
+  // here rather than re-parsed, so Research/Preparation/UI/Material all
+  // agree on the same normalized clinic name and structured handoff data.
+  const clinicName = meeting.clinic_name || event.title;
+  const sanitizedIsHandoff = meeting.is_handoff ? sanitizeIsHandoff(meeting.is_handoff) : null;
 
   const { data: checkpoint } = await admin
     .from("meeting_preparations")
@@ -183,14 +188,14 @@ export async function runAutoPreparationForMeeting(meetingId: string, jobAttempt
 
     try {
       const researchPromptInput = {
-        clinicName: event.title,
+        clinicName,
         calendarTitle: event.title,
         scheduledStartAt: meeting.scheduled_start_at,
+        homepageUrl: sanitizedIsHandoff?.homepage_url ?? null,
       };
       research = await researchClinic({
         groundedPrompt: buildResearchPrompt(researchPromptInput),
         degradedPrompt: buildDegradedResearchPrompt(researchPromptInput),
-        attempts: jobAttempts,
       });
 
       if (researchRun) {
@@ -253,7 +258,7 @@ export async function runAutoPreparationForMeeting(meetingId: string, jobAttempt
 
   try {
     const skill = await loadMedicalFsE1Skill();
-    const { model: generationModel } = getGeminiCredentials("generation", { attempts: jobAttempts });
+    const { model: generationModel } = getGeminiCredentials("generation");
 
     const { data: insertedPreparationRun } = await admin
       .from("agent_runs")
@@ -273,14 +278,13 @@ export async function runAutoPreparationForMeeting(meetingId: string, jobAttempt
     preparationRun = insertedPreparationRun;
 
     const generation = await generateStructuredJson(buildAutoPreparationPrompt({
-      clinicName: event.title,
+      clinicName,
       calendarTitle: event.title,
       scheduledStartAt: meeting.scheduled_start_at,
-      calendarDescription: event.description,
-      includePrivateNotes: flag.config.includePrivateCalendarNotes,
+      sanitizedIsHandoff,
       research,
       skillContent: skill.content,
-    }), { attempts: jobAttempts });
+    }));
 
     const preparation = parsePreparation(generation.rawText);
 
@@ -326,6 +330,9 @@ export async function runAutoPreparationForMeeting(meetingId: string, jobAttempt
         key_points: preparation.key_points,
         talk_script_markdown: preparation.talk_script_markdown,
         sources: preparation.sources,
+        today_conclusion: preparation.today_conclusion,
+        assumed_outs: preparation.assumed_outs,
+        e2_conditions: preparation.e2_conditions,
         attempt_count: (existing?.attempt_count ?? 0) + 1,
         error_safe: null,
         generated_at: new Date().toISOString(),

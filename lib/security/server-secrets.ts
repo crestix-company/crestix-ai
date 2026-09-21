@@ -59,33 +59,9 @@ const GEMINI_STAGE_ENV_KEY: Record<GeminiStage, string> = {
   generation: "GEMINI_GENERATION_MODEL",
 };
 
-/**
- * After this many attempts of the SAME job keep failing, the
- * generation-stage call switches to a separately-configured fallback model
- * rather than continuing to hammer the primary one. In practice this only
- * engages for persistent transient/capacity failures (503 "high demand"):
- * a configuration error (404) short-circuits to FAILED on its very first
- * attempt (see GeminiApiError.isConfigurationError) without ever reaching
- * this threshold, so attempt count alone is a safe, simple proxy without
- * needing to thread specific error classifications down from the job
- * processor. Applies to Preparation, Material, and the Research Agent's own
- * DEGRADED fallback - all three resolve credentials via the "generation"
- * stage.
- */
-const GENERATION_FALLBACK_AFTER_ATTEMPTS = 3;
-const GEMINI_GENERATION_FALLBACK_DEFAULT_MODEL = "gemini-3.5-flash-lite";
-
-export function getGeminiCredentials(
-  stage: GeminiStage,
-  options?: { attempts?: number },
-): { apiKey: string; model: string } {
+export function getGeminiCredentials(stage: GeminiStage): { apiKey: string; model: string } {
   const apiKey = process.env["GEMINI_API_KEY"];
   if (!apiKey) throw new Error("GEMINI_API_KEY is missing");
-
-  if (stage === "generation" && (options?.attempts ?? 0) >= GENERATION_FALLBACK_AFTER_ATTEMPTS) {
-    const fallbackModel = process.env["GEMINI_GENERATION_FALLBACK_MODEL"] || GEMINI_GENERATION_FALLBACK_DEFAULT_MODEL;
-    return { apiKey, model: fallbackModel };
-  }
 
   const model = process.env[GEMINI_STAGE_ENV_KEY[stage]]
     || process.env["GEMINI_MODEL"]

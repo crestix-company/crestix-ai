@@ -28,7 +28,10 @@ export const JSON_SCHEMA_SKELETON = `{
   "withdrawal_conditions": ["..."],
   "key_points": ["..."],
   "talk_script_markdown": "# 【事前準備】〇〇クリニック\\n...\\n# 【E1】〇〇クリニック｜トークスクリプト\\n...",
-  "sources": [{ "label": "...", "url": "https://..." }]
+  "sources": [{ "label": "...", "url": "https://..." }],
+  "today_conclusion": "...",
+  "assumed_outs": [{ "objection": "...", "reason_hypothesis": "...", "recommended_response": "...", "next_question": "...", "switch_condition": "...", "withdrawal_condition": "..." }],
+  "e2_conditions": ["..."]
 }`;
 
 export interface PreparationPromptInput {

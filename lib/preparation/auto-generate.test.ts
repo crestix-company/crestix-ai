@@ -159,6 +159,70 @@ describe("runAutoPreparationForMeeting", () => {
     expect(calls["meeting_materials:upsert"]).toBeUndefined();
   });
 
+  it("uses the persisted clinic_name (not the raw Calendar title) and passes only the sanitized IS handoff into the Preparation prompt", async () => {
+    vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
+    vi.mocked(researchClinic).mockResolvedValue({
+      summary: "調査結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-2.5-flash-lite",
+      researchMode: "GROUNDED", groundingStatus: "SUCCESS",
+    });
+    vi.mocked(generateStructuredJson).mockResolvedValueOnce({
+      rawText: validPreparationJson, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.8-flash",
+    });
+
+    const meetingRowWithHandoff = {
+      ...meetingRow,
+      clinic_name: "渋谷胃腸クリニック",
+      is_handoff: {
+        appointment_setter: "前田",
+        fs_owner: "前川",
+        contact_email: "contact@example.com",
+        clinic_phone: "03-1234-5678",
+        contact_name: "後藤 直樹",
+        contact_role: "院長",
+        paid_awareness: "有り",
+        patient_acceptance: null,
+        personality_note: null,
+        article_status: null,
+        article_url: null,
+        concern_exists: null,
+        concern_detail: null,
+        growth_area: null,
+        new_patient_capacity: null,
+        prior_outcome: null,
+        prior_outcome_detail: null,
+        focus_department: null,
+        homepage_url: "https://shibuya-clinic.example.com",
+        notes: null,
+      },
+    };
+
+    const { client } = makeAdminMock({
+      "meetings:select": [{ data: meetingRowWithHandoff, error: null }],
+      "calendar_events:select": [{ data: eventRow, error: null }],
+      "agent_runs:insert": [{ data: { id: "agent-run-1" }, error: null }],
+      "meeting_preparations:select": [{ data: { attempt_count: 0 }, error: null }],
+      "meeting_preparations:upsert": [{ data: null, error: null }, { data: { id: "prep-1" }, error: null }],
+      "jobs:upsert": [{ data: { id: "material-job-1" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await runAutoPreparationForMeeting("meeting-1");
+
+    const preparationPrompt = vi.mocked(generateStructuredJson).mock.calls[0][0];
+    expect(preparationPrompt).toContain("渋谷胃腸クリニック");
+    expect(preparationPrompt).toContain("担当者の役職: 院長");
+    expect(preparationPrompt).toContain("HP URL: https://shibuya-clinic.example.com");
+    expect(preparationPrompt).not.toContain("後藤 直樹");
+    expect(preparationPrompt).not.toContain("contact@example.com");
+    expect(preparationPrompt).not.toContain("03-1234-5678");
+    expect(preparationPrompt).not.toContain("前田");
+    expect(preparationPrompt).not.toContain("前川");
+
+    const researchPrompt = vi.mocked(researchClinic).mock.calls[0][0];
+    expect(researchPrompt.groundedPrompt).toContain("渋谷胃腸クリニック");
+    expect(researchPrompt.groundedPrompt).toContain("Calendar記載のHP URL: https://shibuya-clinic.example.com");
+  });
+
   it("does not enqueue a MATERIAL_GENERATION job when generateMaterials is disabled", async () => {
     vi.mocked(loadAutoPreparationFlag).mockResolvedValue({
       ...enabledFlag,
@@ -241,7 +305,7 @@ describe("runAutoPreparationForMeeting", () => {
     });
     vi.mocked(createAdminClient).mockReturnValue(client as never);
 
-    await runAutoPreparationForMeeting("meeting-1", 3);
+    await runAutoPreparationForMeeting("meeting-1");
 
     expect(researchClinic).not.toHaveBeenCalled();
     expect(generateStructuredJson).toHaveBeenCalledTimes(1);

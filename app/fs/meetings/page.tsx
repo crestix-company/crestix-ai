@@ -48,18 +48,24 @@ export default async function MeetingsPage({
   const q = params?.q?.trim().toLowerCase() ?? "";
   const supabase = await createClient();
 
+  // Medical FS MVP scope: only E1/E2 (【お打ち合わせ①】/【お打ち合わせ②】)
+  // meetings are shown here. Historic HD/OTHER/legacy-marker meetings stay
+  // in the DB for audit but are never surfaced in this UI - see
+  // docs/calendar-detection.md.
   const { data, error } = await supabase
     .from("meetings")
     .select(
-      "id,meeting_type,status,scheduled_start_at,scheduled_end_at,calendar_events!inner(title,event_status),profiles!meetings_fs_user_id_fkey(display_name,email)",
+      "id,meeting_type,status,scheduled_start_at,scheduled_end_at,clinic_name,calendar_events!inner(title,event_status),profiles!meetings_fs_user_id_fkey(display_name,email)",
     )
+    .in("meeting_type", ["E1", "E2"])
     .neq("status", "CANCELLED")
     .order("scheduled_start_at", { ascending: true })
     .limit(200);
 
   const meetings = (error ? [] : data ?? []).filter((meeting) => {
     if (!q) return true;
-    return eventTitle(meeting.calendar_events).toLowerCase().includes(q);
+    const displayName = meeting.clinic_name || eventTitle(meeting.calendar_events);
+    return displayName.toLowerCase().includes(q) || eventTitle(meeting.calendar_events).toLowerCase().includes(q);
   });
 
   const count = (statuses: MeetingStatus[]) =>
@@ -123,9 +129,9 @@ export default async function MeetingsPage({
                   key={meeting.id}
                 >
                   <div>
-                    <p className="font-medium">{eventTitle(meeting.calendar_events)}</p>
+                    <p className="font-medium">{meeting.clinic_name || eventTitle(meeting.calendar_events)}</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {ownerName(meeting.profiles)}
+                      {meeting.meeting_type} ・ {ownerName(meeting.profiles)}
                     </p>
                   </div>
                   <p className="text-sm">{meeting.meeting_type}</p>

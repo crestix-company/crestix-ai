@@ -181,10 +181,10 @@ export async function processCalendarJob(
       await ensureCalendarWatch(pending.google_connection_id, appOrigin, { force: true });
     } else if (pending.job_type === "MEETING_PREPARATION") {
       if (!pending.meeting_id) throw new Error("meeting_preparation_job_meeting_missing");
-      await runAutoPreparationForMeeting(pending.meeting_id, nextAttempts);
+      await runAutoPreparationForMeeting(pending.meeting_id);
     } else if (pending.job_type === "MATERIAL_GENERATION") {
       if (!pending.meeting_id) throw new Error("material_generation_job_meeting_missing");
-      await runMaterialGenerationForMeeting(pending.meeting_id, nextAttempts);
+      await runMaterialGenerationForMeeting(pending.meeting_id);
     } else {
       throw new Error("unsupported_job_type");
     }

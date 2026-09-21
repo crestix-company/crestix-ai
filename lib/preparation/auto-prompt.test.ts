@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { SanitizedIsHandoff } from "@/lib/preparation/is-handoff";
 import { buildAutoPreparationPrompt, buildDegradedResearchPrompt, buildMaterialPrompt, buildResearchPrompt } from "./auto-prompt";
 
 const research = {
@@ -9,6 +10,23 @@ const research = {
   model: "gemini-2.5-flash-lite",
   researchMode: "GROUNDED" as const,
   groundingStatus: "SUCCESS" as const,
+};
+
+const sanitizedHandoff: SanitizedIsHandoff = {
+  contact_role: "院長",
+  paid_awareness: "有り",
+  patient_acceptance: "可能",
+  personality_note: "穏やかな方",
+  article_status: "記事なし",
+  concern_exists: "有",
+  concern_detail: "予算が厳しいと聞いている",
+  growth_area: "特になし",
+  new_patient_capacity: "そこそこ",
+  prior_outcome: "アウト無",
+  prior_outcome_detail: null,
+  focus_department: "特になし",
+  homepage_url: "https://shibuya-clinic.example.com",
+  notes: "院長は物腰柔らかい",
 };
 
 describe("buildResearchPrompt", () => {
@@ -24,6 +42,28 @@ describe("buildResearchPrompt", () => {
     expect(prompt).toContain("営業判断は行わない");
     expect(prompt).not.toContain("medical-fs-e1-complete");
   });
+
+  it("states the Calendar HP URL as the top research priority when provided", () => {
+    const prompt = buildResearchPrompt({
+      clinicName: "テストクリニック",
+      calendarTitle: "タイトル",
+      scheduledStartAt: null,
+      homepageUrl: "https://shibuya-clinic.example.com",
+    });
+
+    expect(prompt).toContain("Calendar記載のHP URL: https://shibuya-clinic.example.com");
+    expect(prompt).toContain("1. Calendar記載のHP URL");
+  });
+
+  it("omits the HP URL line when none was provided", () => {
+    const prompt = buildResearchPrompt({
+      clinicName: "テストクリニック",
+      calendarTitle: "タイトル",
+      scheduledStartAt: null,
+    });
+
+    expect(prompt).not.toContain("Calendar記載のHP URL:");
+  });
 });
 
 describe("buildDegradedResearchPrompt", () => {
@@ -36,10 +76,10 @@ describe("buildDegradedResearchPrompt", () => {
 
     expect(prompt).toContain("Google Search（Web検索）を使用していません");
     expect(prompt).toContain("調査した");
-    expect(prompt).toContain("SEO順位");
-    expect(prompt).toContain("MEO状況");
-    expect(prompt).toContain("競合状況");
-    expect(prompt).toContain("院長情報");
+    expect(prompt).toContain("SEO");
+    expect(prompt).toContain("MEO");
+    expect(prompt).toContain("競合");
+    expect(prompt).toContain("院長");
     expect(prompt).toContain("商談当日に確認すべき事項");
     expect(prompt).not.toContain("medical-fs-e1-complete");
   });
@@ -52,8 +92,7 @@ describe("buildAutoPreparationPrompt", () => {
       clinicName: "テストクリニック",
       calendarTitle: "タイトル",
       scheduledStartAt: null,
-      calendarDescription: null,
-      includePrivateNotes: false,
+      sanitizedIsHandoff: null,
       research: degradedResearch,
       skillContent: "content",
     });
@@ -67,42 +106,57 @@ describe("buildAutoPreparationPrompt", () => {
       clinicName: "テストクリニック",
       calendarTitle: "タイトル",
       scheduledStartAt: null,
-      calendarDescription: null,
-      includePrivateNotes: false,
+      sanitizedIsHandoff: null,
       research,
       skillContent: "content",
     });
 
     expect(prompt).not.toContain("Research Mode: DEGRADED");
   });
-  it("omits the Calendar description when include_private_calendar_notes is false", () => {
+
+  it("renders the sanitized IS handoff fields, never any raw Calendar description text", () => {
     const prompt = buildAutoPreparationPrompt({
       clinicName: "テストクリニック",
       calendarTitle: "タイトル",
       scheduledStartAt: null,
-      calendarDescription: "非公開のIS引き継ぎメモ：カード情報あり",
-      includePrivateNotes: false,
+      sanitizedIsHandoff: sanitizedHandoff,
       research,
-      skillContent: "# SKILL MARKER",
+      skillContent: "content",
     });
 
-    expect(prompt).not.toContain("非公開のIS引き継ぎメモ");
-    expect(prompt).toContain("# SKILL MARKER");
-    expect(prompt).toContain("https://example.com/clinic");
+    expect(prompt).toContain("担当者の役職: 院長");
+    expect(prompt).toContain("懸念の詳細: 予算が厳しいと聞いている");
+    expect(prompt).toContain("HP URL: https://shibuya-clinic.example.com");
+    expect(prompt).not.toContain("非公開");
   });
 
-  it("includes the Calendar description only when include_private_calendar_notes is true", () => {
+  it("shows a placeholder when there is no IS handoff data at all", () => {
     const prompt = buildAutoPreparationPrompt({
       clinicName: "テストクリニック",
       calendarTitle: "タイトル",
       scheduledStartAt: null,
-      calendarDescription: "IS引き継ぎメモ",
-      includePrivateNotes: true,
+      sanitizedIsHandoff: null,
       research,
-      skillContent: "# SKILL MARKER",
+      skillContent: "content",
     });
 
-    expect(prompt).toContain("IS引き継ぎメモ");
+    expect(prompt).toContain("IS引継ぎメモの記載なし");
+  });
+
+  it("instructs assumed_outs generation to prioritize an already-known IS concern/prior OUT", () => {
+    const prompt = buildAutoPreparationPrompt({
+      clinicName: "テストクリニック",
+      calendarTitle: "タイトル",
+      scheduledStartAt: null,
+      sanitizedIsHandoff: sanitizedHandoff,
+      research,
+      skillContent: "content",
+    });
+
+    expect(prompt).toContain("assumed_outs");
+    expect(prompt).toContain("最優先で");
+    expect(prompt).toContain("today_conclusion");
+    expect(prompt).toContain("e2_conditions");
   });
 
   it("instructs facts to use only Research Agent sources and never invent URLs", () => {
@@ -110,8 +164,7 @@ describe("buildAutoPreparationPrompt", () => {
       clinicName: "テストクリニック",
       calendarTitle: "タイトル",
       scheduledStartAt: null,
-      calendarDescription: null,
-      includePrivateNotes: false,
+      sanitizedIsHandoff: null,
       research,
       skillContent: "content",
     });

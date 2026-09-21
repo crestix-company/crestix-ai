@@ -14,10 +14,12 @@ import {
   type GoogleCalendarEvent,
 } from "@/lib/google/calendar-api";
 import { detectFsMeeting } from "@/lib/google/meeting-detection";
+import { extractClinicName } from "@/lib/google/clinic-name";
 import { hashCalendarChannelToken } from "@/lib/google/webhook";
 import { enqueueMeetingPreparationJob } from "@/lib/jobs/queue";
 import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility";
 import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
+import { parseIsHandoff } from "@/lib/preparation/is-handoff";
 
 /**
  * Both bounds matter for an initial (non-syncToken) sync. timeMin alone
@@ -217,7 +219,7 @@ async function upsertCalendarEventAndMeeting(
 
   const { data: existingMeeting, error: meetingLookupError } = await admin
     .from("meetings")
-    .select("id,status")
+    .select("id,status,meeting_type")
     .eq("calendar_event_id", storedEvent.id)
     .maybeSingle();
   if (meetingLookupError) throw new Error("meeting_lookup_failed");
@@ -225,7 +227,15 @@ async function upsertCalendarEventAndMeeting(
   const detection = detectFsMeeting(title);
 
   if (!detection) {
-    if (existingMeeting && existingMeeting.status !== "CANCELLED") {
+    // Medical FS MVP scope only matches 【お打ち合わせ①】/【お打ち合わせ②】.
+    // An existing E1/E2 meeting whose title was edited to no longer match
+    // (e.g. the marker was removed) is still correctly auto-cancelled here.
+    // An existing HD/OTHER/legacy-marker meeting from an earlier ruleset
+    // must NOT be touched - it's out of scope, kept only for audit/history,
+    // and re-processing that same Calendar event on a later sync (its title
+    // still matches nothing) must not silently flip its status.
+    const inScopeType = existingMeeting?.meeting_type === "E1" || existingMeeting?.meeting_type === "E2";
+    if (existingMeeting && inScopeType && existingMeeting.status !== "CANCELLED") {
       const { error } = await admin
         .from("meetings")
         .update({ status: "CANCELLED" })
@@ -239,6 +249,9 @@ async function upsertCalendarEventAndMeeting(
   let meetingStatus = cancelled ? "CANCELLED" : (existingMeeting?.status ?? "DETECTED");
   if (!cancelled && meetingStatus === "CANCELLED") meetingStatus = "DETECTED";
 
+  const clinicName = extractClinicName(title);
+  const isHandoff = parseIsHandoff(event.description ?? null);
+
   const { data: storedMeeting, error: meetingError } = await admin
     .from("meetings")
     .upsert({
@@ -251,6 +264,8 @@ async function upsertCalendarEventAndMeeting(
       scheduled_end_at: endAt,
       source: "GOOGLE_CALENDAR",
       detection_rule: detection.ruleId,
+      clinic_name: clinicName || null,
+      is_handoff: isHandoff,
     }, { onConflict: "calendar_event_id" })
     .select("id")
     .single();

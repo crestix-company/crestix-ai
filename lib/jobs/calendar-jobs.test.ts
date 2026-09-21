@@ -121,7 +121,7 @@ describe("processCalendarJob - MEETING_PREPARATION", () => {
     const result = await processCalendarJob("job-1", "https://example.test");
 
     expect(result).toBe("done");
-    expect(runAutoPreparationForMeeting).toHaveBeenCalledWith("meeting-1", 1);
+    expect(runAutoPreparationForMeeting).toHaveBeenCalledWith("meeting-1");
     expect(syncGoogleCalendarConnection).not.toHaveBeenCalled();
     expect(ensureCalendarWatch).not.toHaveBeenCalled();
   });
@@ -293,7 +293,7 @@ describe("processCalendarJob - MATERIAL_GENERATION", () => {
     const result = await processCalendarJob("job-4", "https://example.test");
 
     expect(result).toBe("done");
-    expect(runMaterialGenerationForMeeting).toHaveBeenCalledWith("meeting-1", 1);
+    expect(runMaterialGenerationForMeeting).toHaveBeenCalledWith("meeting-1");
   });
 
   it("on final failure, marks only meeting_materials FAILED - never meeting_preparations or meetings", async () => {

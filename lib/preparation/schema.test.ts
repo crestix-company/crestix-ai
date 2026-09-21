@@ -39,6 +39,41 @@ describe("PreparationResultSchema", () => {
     }
   });
 
+  it("defaults today_conclusion/assumed_outs/e2_conditions when absent - the existing manual ChatGPT fallback's pasted JSON, which predates these fields, must still validate", () => {
+    const result = PreparationResultSchema.safeParse(fullValid);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.today_conclusion).toBe("");
+      expect(result.data.assumed_outs).toEqual([]);
+      expect(result.data.e2_conditions).toEqual([]);
+    }
+  });
+
+  it("accepts a payload with assumed_outs populated, defaulting missing sub-fields", () => {
+    const result = PreparationResultSchema.safeParse({
+      ...fullValid,
+      today_conclusion: "新患獲得より既存患者の単価向上に興味がありそう",
+      assumed_outs: [{ objection: "今は新規患者をそこまで増やしたくない" }],
+      e2_conditions: ["Web集患への課題感を示した場合"],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.assumed_outs[0]).toMatchObject({
+        objection: "今は新規患者をそこまで増やしたくない",
+        reason_hypothesis: "",
+        recommended_response: "",
+      });
+    }
+  });
+
+  it("rejects an assumed_out with an empty objection", () => {
+    const result = PreparationResultSchema.safeParse({
+      ...fullValid,
+      assumed_outs: [{ objection: "" }],
+    });
+    expect(result.success).toBe(false);
+  });
+
   it("accepts a fully populated payload", () => {
     const result = PreparationResultSchema.safeParse(fullValid);
     expect(result.success).toBe(true);
