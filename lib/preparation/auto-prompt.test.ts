@@ -6,6 +6,7 @@ const research = {
   sources: [{ url: "https://example.com/clinic", title: "公式サイト" }],
   searchCallCount: 1,
   usage: { inputTokens: 1, outputTokens: 1 },
+  model: "gemini-2.5-flash-lite",
 };
 
 describe("buildResearchPrompt", () => {

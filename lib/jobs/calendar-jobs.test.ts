@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ensureCalendarWatch, syncGoogleCalendarConnection } from "@/lib/google/calendar-sync";
+import { GeminiApiError } from "@/lib/gemini/client";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
 import { runMaterialGenerationForMeeting } from "@/lib/preparation/material-generate";
 import { processCalendarJob, runDueCalendarJobs, runJobToCompletionOrBudget } from "./calendar-jobs";
@@ -293,6 +294,28 @@ describe("processCalendarJob - MATERIAL_GENERATION", () => {
     }]);
     expect(calls.meetings).toBeUndefined();
     expect(calls.meeting_preparations).toBeUndefined();
+  });
+
+  it("fails immediately on a Gemini configuration error (retired/nonexistent model, 404), without waiting for MAX_ATTEMPTS", async () => {
+    // A 404 means the requested model doesn't exist - retrying with
+    // exponential backoff would just repeat the identical failure until
+    // attempts are exhausted, wasting time before ever being actionable.
+    vi.mocked(runMaterialGenerationForMeeting).mockRejectedValueOnce(
+      new GeminiApiError("generate_content", 404, "models/gemini-2.5-flash is no longer available to new users"),
+    );
+    const { client, calls } = makeAdminMock({
+      // attempts=0 -> nextAttempts=1, nowhere near MAX_ATTEMPTS=5
+      "jobs:select": [{ data: { id: "job-4", job_type: "MATERIAL_GENERATION", google_connection_id: null, meeting_id: "meeting-1", status: "PENDING", attempts: 0, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-4" }, error: null }],
+      "meeting_materials:update": [{ data: null, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const result = await processCalendarJob("job-4", "https://example.test");
+
+    expect(result).toBe("failed");
+    const finalUpdate = calls.jobs[calls.jobs.length - 1] as Record<string, unknown>;
+    expect(finalUpdate.status).toBe("FAILED");
   });
 
   it("retries with backoff before max attempts, without touching meeting_materials", async () => {

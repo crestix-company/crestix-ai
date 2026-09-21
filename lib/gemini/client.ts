@@ -23,6 +23,20 @@ export class GeminiApiError extends Error {
     super(`Gemini API operation failed: ${operation} (${status})${detail ? ` - ${detail}` : ""}`);
     this.name = "GeminiApiError";
   }
+
+  /**
+   * A 404 on generate_content means the requested model doesn't exist or
+   * is no longer available (confirmed live: "This model
+   * models/gemini-2.5-flash is no longer available to new users") - this
+   * is inherently a configuration problem, not a transient failure.
+   * Retrying it with exponential backoff just repeats the identical
+   * failure until MAX_ATTEMPTS is exhausted, burning the retry budget
+   * before ever surfacing that the actual fix is a model name change, not
+   * "try again later".
+   */
+  get isConfigurationError(): boolean {
+    return this.status === 404;
+  }
 }
 
 interface GeminiPart {
@@ -68,8 +82,7 @@ function textFrom(candidate: GeminiCandidate | undefined): string {
   return candidate?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
 }
 
-async function callGemini(body: Record<string, unknown>): Promise<GeminiGenerateContentResponse> {
-  const { apiKey, model } = getGeminiCredentials();
+async function callGemini(apiKey: string, model: string, body: Record<string, unknown>): Promise<GeminiGenerateContentResponse> {
   const response = await fetch(`${GEMINI_BASE}/models/${model}:generateContent`, {
     method: "POST",
     headers: {
@@ -97,15 +110,20 @@ export interface ResearchResult {
   sources: Array<{ url: string; title?: string }>;
   searchCallCount: number;
   usage: GeminiUsage;
+  /** The actual model used for this call - for agent_runs observability. */
+  model: string;
 }
 
 /**
  * STEP A (Research Agent). Google Search grounding cannot be combined with
  * responseSchema/JSON mode in the same call, so this step returns free text
  * plus grounding sources; STEP B turns that into the structured preparation.
+ * Uses the "research" stage model (must support Google Search grounding on
+ * the free tier - see getGeminiCredentials' docstring).
  */
 export async function researchClinic(prompt: string): Promise<ResearchResult> {
-  const data = await callGemini({
+  const { apiKey, model } = getGeminiCredentials("research");
+  const data = await callGemini(apiKey, model, {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     tools: [{ google_search: {} }],
   });
@@ -122,20 +140,29 @@ export async function researchClinic(prompt: string): Promise<ResearchResult> {
     sources,
     searchCallCount: candidate?.groundingMetadata?.webSearchQueries?.length ?? (sources.length > 0 ? 1 : 0),
     usage: usageFrom(data),
+    model,
   };
 }
 
 export interface StructuredGenerationResult {
   rawText: string;
   usage: GeminiUsage;
+  /** The actual model used for this call - for agent_runs observability. */
+  model: string;
 }
 
-/** JSON-mode call (no search tool). Caller parses/validates rawText. */
+/**
+ * JSON-mode call (no search tool). Caller parses/validates rawText. Uses
+ * the "generation" stage model (Preparation and Material both use this -
+ * neither needs Google Search grounding, so the current GA stable model
+ * can be used for output quality rather than the grounding-capable one).
+ */
 export async function generateStructuredJson(prompt: string): Promise<StructuredGenerationResult> {
-  const data = await callGemini({
+  const { apiKey, model } = getGeminiCredentials("generation");
+  const data = await callGemini(apiKey, model, {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: { responseMimeType: "application/json" },
   });
 
-  return { rawText: textFrom(data.candidates?.[0]), usage: usageFrom(data) };
+  return { rawText: textFrom(data.candidates?.[0]), usage: usageFrom(data), model };
 }

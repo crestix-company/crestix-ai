@@ -88,7 +88,6 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
   });
   if (!eligible || !flag) return;
 
-  const { model } = getGeminiCredentials();
   const admin = createAdminClient();
 
   await admin.from("meetings").update({ status: "PREPARING" }).eq("id", meetingId).neq("status", "CANCELLED");
@@ -98,6 +97,11 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
     source_mode: "API",
   }, { onConflict: "meeting_id" });
 
+  // Resolved up front only to populate the agent_runs row before the call
+  // completes - researchClinic/generateStructuredJson resolve the same
+  // (deterministic, env-based) credentials internally for the actual call.
+  const { model: researchModel } = getGeminiCredentials("research");
+
   const { data: researchRun } = await admin
     .from("agent_runs")
     .insert({
@@ -105,7 +109,7 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
       initiated_by_user_id: meeting.fs_user_id,
       mode: "RESEARCH",
       provider: GEMINI_PROVIDER,
-      model,
+      model: researchModel,
       status: "RUNNING",
       trigger_source: "GOOGLE_CALENDAR",
       started_at: new Date().toISOString(),
@@ -138,6 +142,7 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
     }
 
     const skill = await loadMedicalFsE1Skill();
+    const { model: generationModel } = getGeminiCredentials("generation");
 
     const { data: insertedPreparationRun } = await admin
       .from("agent_runs")
@@ -147,7 +152,7 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
         skill_version_id: skill.skillVersionId,
         mode: "PREPARATION",
         provider: GEMINI_PROVIDER,
-        model,
+        model: generationModel,
         status: "RUNNING",
         trigger_source: "GOOGLE_CALENDAR",
         started_at: new Date().toISOString(),

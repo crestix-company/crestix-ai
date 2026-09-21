@@ -74,7 +74,7 @@ export async function runMaterialGenerationForMeeting(meetingId: string): Promis
     sources: preparationRow.sources,
   } satisfies Partial<PreparationResult> as PreparationResult);
 
-  const { model } = getGeminiCredentials();
+  const { model } = getGeminiCredentials("generation");
   const startedAt = new Date().toISOString();
 
   const { data: agentRun } = await admin

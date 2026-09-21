@@ -9,6 +9,7 @@ import {
   syncGoogleCalendarConnection,
   SYNC_TIME_BUDGET_MS,
 } from "@/lib/google/calendar-sync";
+import { GeminiApiError } from "@/lib/gemini/client";
 import { runAutoPreparationForMeeting } from "@/lib/preparation/auto-generate";
 import { runMaterialGenerationForMeeting } from "@/lib/preparation/material-generate";
 import { getCronSecret } from "@/lib/security/server-secrets";
@@ -200,7 +201,12 @@ export async function processCalendarJob(
     return "done";
   } catch (error) {
     const safeError = safeCalendarErrorCode(error);
-    if (nextAttempts >= MAX_ATTEMPTS) {
+    // A retired/nonexistent Gemini model (404) is a configuration problem,
+    // not a transient failure - exponential-backoff retrying it would just
+    // repeat the identical failure MAX_ATTEMPTS times before ever
+    // surfacing that the real fix is a model name, not "try again".
+    const isConfigurationError = error instanceof GeminiApiError && error.isConfigurationError;
+    if (nextAttempts >= MAX_ATTEMPTS || isConfigurationError) {
       await admin
         .from("jobs")
         .update({

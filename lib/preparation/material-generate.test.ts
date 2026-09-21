@@ -75,7 +75,7 @@ beforeEach(() => {
 describe("runMaterialGenerationForMeeting", () => {
   it("generates and saves a READY material from an existing READY preparation", async () => {
     vi.mocked(generateStructuredJson).mockResolvedValue({
-      rawText: validMaterialJson, usage: { inputTokens: 5, outputTokens: 6 },
+      rawText: validMaterialJson, usage: { inputTokens: 5, outputTokens: 6 }, model: "gemini-3.8-flash",
     });
     const { client, calls } = makeAdminMock({
       "meetings:select": [{ data: meetingRow, error: null }],
@@ -97,7 +97,7 @@ describe("runMaterialGenerationForMeeting", () => {
 
   it("re-throws (does not swallow) on a Gemini schema-invalid response, and marks the agent run FAILED", async () => {
     vi.mocked(generateStructuredJson).mockResolvedValue({
-      rawText: "これはJSONではありません", usage: { inputTokens: 1, outputTokens: 1 },
+      rawText: "これはJSONではありません", usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.8-flash",
     });
     const { client, calls } = makeAdminMock({
       "meetings:select": [{ data: meetingRow, error: null }],
