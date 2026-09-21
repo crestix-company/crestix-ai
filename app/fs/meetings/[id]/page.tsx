@@ -82,7 +82,7 @@ export default async function MeetingDetailPage({
     ? await supabase
         .from("meeting_preparations")
         .select(
-          "status,source_mode,attempt_count,generated_at,facts,hypotheses,needs_confirmation,clinic_summary,current_measures,medical_services,doctor,area,competitors,seo,meo,portals,sales_hypotheses,proposal_candidates,objections,recommended_responses,must_ask,withdrawal_conditions,key_points,talk_script_markdown,sources",
+          "status,source_mode,attempt_count,generated_at,research_mode,grounding_status,research_model,facts,hypotheses,needs_confirmation,clinic_summary,current_measures,medical_services,doctor,area,competitors,seo,meo,portals,sales_hypotheses,proposal_candidates,objections,recommended_responses,must_ask,withdrawal_conditions,key_points,talk_script_markdown,sources",
         )
         .eq("meeting_id", id)
         .maybeSingle()
@@ -93,6 +93,9 @@ export default async function MeetingDetailPage({
     source_mode: string;
     attempt_count: number;
     generated_at: string | null;
+    research_mode: "GROUNDED" | "DEGRADED" | null;
+    grounding_status: "SUCCESS" | "UNAVAILABLE" | "FAILED" | null;
+    research_model: string | null;
   }) | null;
 
   let prompt: string | null = null;
@@ -174,10 +177,21 @@ export default async function MeetingDetailPage({
                 {preparation?.source_mode === "API" ? (
                   <div className="rounded-md border bg-card p-3 text-sm">
                     <p className="font-medium">
-                      {preparation.status === "READY" && "自動生成済み（Gemini 2.5 Flash）"}
+                      {preparation.status === "READY" && `自動生成済み（${preparation.research_model ?? "Gemini"}）`}
                       {preparation.status === "PREPARING" && "Gemini自動生成中です。しばらくしてから再読み込みしてください。"}
                       {preparation.status === "FAILED" && "自動生成に失敗しました。手動ChatGPTフローをご利用ください。"}
                     </p>
+                    {preparation.research_mode ? (
+                      <p className="mt-1 text-xs">
+                        {preparation.research_mode === "GROUNDED" ? (
+                          <span className="text-emerald-600 dark:text-emerald-400">Web検索済み</span>
+                        ) : (
+                          <span className="text-amber-600 dark:text-amber-400">
+                            Web検索未実施（Free Tier制限）— 事実は未確認、要確認事項に整理済み
+                          </span>
+                        )}
+                      </p>
+                    ) : null}
                     {preparation.status !== "PREPARING" ? (
                       <p className="mt-1 text-xs text-muted-foreground">
                         最終生成日時: {formatDate(preparation.generated_at)}

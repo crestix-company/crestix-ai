@@ -35,20 +35,22 @@ export function getCronSecret(): string {
 export type GeminiStage = "research" | "generation";
 
 /**
- * Stage-specific model selection, not one shared model: gemini-2.5-flash
- * was retired for new users (confirmed live via a real 404 - "This model
- * models/gemini-2.5-flash is no longer available to new users"), and its
- * replacement isn't one-size-fits-all. STEP A (Research) needs Google
- * Search grounding, which on the free tier is only available on specific
- * models (gemini-2.5-flash-lite) - Gemini 3.x grounding is not available
- * on the free tier at all. STEP B/C (Preparation/Material) don't use
- * grounding and can use the current GA stable model for output quality.
- * GEMINI_RESEARCH_MODEL / GEMINI_GENERATION_MODEL take priority; the
- * legacy GEMINI_MODEL (if still set) is a backward-compatible fallback,
- * then these hardcoded defaults.
+ * Stage-specific model selection, not one shared model. gemini-2.5-flash
+ * AND gemini-2.5-flash-lite are both retired for new users (confirmed live
+ * via real 404s - "This model ... is no longer available to new users.
+ * Please update your code to use models/gemini-3.5-flash-lite"). STEP A
+ * (Research) needs Google Search grounding; gemini-3.5-flash-lite is a
+ * valid, reachable model for it, though this account currently hits a 429
+ * quota/billing limit specifically on grounding (see
+ * lib/gemini/client.ts's researchClinic - it falls back to DEGRADED mode
+ * when grounding is unavailable, rather than failing outright). STEP B/C
+ * (Preparation/Material) don't use grounding and use the confirmed-working
+ * GA stable model. GEMINI_RESEARCH_MODEL / GEMINI_GENERATION_MODEL take
+ * priority; the legacy GEMINI_MODEL (if still set) is a backward-compatible
+ * fallback, then these hardcoded defaults.
  */
 const GEMINI_STAGE_DEFAULT_MODEL: Record<GeminiStage, string> = {
-  research: "gemini-2.5-flash-lite",
+  research: "gemini-3.5-flash-lite",
   generation: "gemini-3.8-flash",
 };
 

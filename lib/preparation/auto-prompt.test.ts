@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAutoPreparationPrompt, buildMaterialPrompt, buildResearchPrompt } from "./auto-prompt";
+import { buildAutoPreparationPrompt, buildDegradedResearchPrompt, buildMaterialPrompt, buildResearchPrompt } from "./auto-prompt";
 
 const research = {
   summary: "公式サイトによると自費診療メニューがある",
@@ -7,6 +7,8 @@ const research = {
   searchCallCount: 1,
   usage: { inputTokens: 1, outputTokens: 1 },
   model: "gemini-2.5-flash-lite",
+  researchMode: "GROUNDED" as const,
+  groundingStatus: "SUCCESS" as const,
 };
 
 describe("buildResearchPrompt", () => {
@@ -24,7 +26,55 @@ describe("buildResearchPrompt", () => {
   });
 });
 
+describe("buildDegradedResearchPrompt", () => {
+  it("never claims web research was performed and routes web-verification items to a confirm-at-meeting list", () => {
+    const prompt = buildDegradedResearchPrompt({
+      clinicName: "テストクリニック",
+      calendarTitle: "【お打ち合わせ①】テストクリニック 様",
+      scheduledStartAt: "2026-09-25T01:00:00.000Z",
+    });
+
+    expect(prompt).toContain("Google Search（Web検索）を使用していません");
+    expect(prompt).toContain("調査した");
+    expect(prompt).toContain("SEO順位");
+    expect(prompt).toContain("MEO状況");
+    expect(prompt).toContain("競合状況");
+    expect(prompt).toContain("院長情報");
+    expect(prompt).toContain("商談当日に確認すべき事項");
+    expect(prompt).not.toContain("medical-fs-e1-complete");
+  });
+});
+
 describe("buildAutoPreparationPrompt", () => {
+  it("injects an explicit DEGRADED-mode constraint block when research.researchMode is DEGRADED, forbidding facts/hypotheses from claiming unverified web content", () => {
+    const degradedResearch = { ...research, researchMode: "DEGRADED" as const, groundingStatus: "UNAVAILABLE" as const, sources: [] };
+    const prompt = buildAutoPreparationPrompt({
+      clinicName: "テストクリニック",
+      calendarTitle: "タイトル",
+      scheduledStartAt: null,
+      calendarDescription: null,
+      includePrivateNotes: false,
+      research: degradedResearch,
+      skillContent: "content",
+    });
+
+    expect(prompt).toContain("Research Mode: DEGRADED");
+    expect(prompt).toContain("needs_confirmationへ入れ");
+  });
+
+  it("omits the DEGRADED-mode constraint block when research.researchMode is GROUNDED", () => {
+    const prompt = buildAutoPreparationPrompt({
+      clinicName: "テストクリニック",
+      calendarTitle: "タイトル",
+      scheduledStartAt: null,
+      calendarDescription: null,
+      includePrivateNotes: false,
+      research,
+      skillContent: "content",
+    });
+
+    expect(prompt).not.toContain("Research Mode: DEGRADED");
+  });
   it("omits the Calendar description when include_private_calendar_notes is false", () => {
     const prompt = buildAutoPreparationPrompt({
       clinicName: "テストクリニック",

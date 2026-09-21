@@ -119,6 +119,7 @@ describe("runAutoPreparationForMeeting", () => {
     vi.mocked(researchClinic).mockResolvedValue({
       summary: "調査結果", sources: [{ url: "https://example.com/clinic" }], searchCallCount: 1,
       usage: { inputTokens: 10, outputTokens: 20 }, model: "gemini-2.5-flash-lite",
+      researchMode: "GROUNDED", groundingStatus: "SUCCESS",
     });
     vi.mocked(generateStructuredJson).mockResolvedValueOnce({
       rawText: validPreparationJson, usage: { inputTokens: 30, outputTokens: 40 }, model: "gemini-3.8-flash",
@@ -162,6 +163,7 @@ describe("runAutoPreparationForMeeting", () => {
     });
     vi.mocked(researchClinic).mockResolvedValue({
       summary: "調査結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-2.5-flash-lite",
+      researchMode: "GROUNDED", groundingStatus: "SUCCESS",
     });
     vi.mocked(generateStructuredJson).mockResolvedValueOnce({
       rawText: validPreparationJson, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.8-flash",
@@ -185,6 +187,7 @@ describe("runAutoPreparationForMeeting", () => {
     vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
     vi.mocked(researchClinic).mockResolvedValue({
       summary: "調査結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-2.5-flash-lite",
+      researchMode: "GROUNDED", groundingStatus: "SUCCESS",
     });
     vi.mocked(generateStructuredJson).mockResolvedValueOnce({
       rawText: "これはJSONではありません", usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.8-flash",

@@ -37,6 +37,25 @@ export class GeminiApiError extends Error {
   get isConfigurationError(): boolean {
     return this.status === 404;
   }
+
+  /**
+   * Classifies the failure for grounding-fallback and observability
+   * purposes, from the status code and Google's own (already-safe, never
+   * secret-bearing) error detail text. "not_found"/"quota"/
+   * "billing_required"/"tool_not_available" all mean "this capability
+   * genuinely isn't available right now" (confirmed live: a 429
+   * RESOURCE_EXHAUSTED "check your plan and billing details" on Google
+   * Search grounding) - "other" means something unexpected happened that's
+   * worth investigating rather than just falling back silently.
+   */
+  get classification(): "not_found" | "quota" | "billing_required" | "tool_not_available" | "other" {
+    const detail = (this.detail ?? "").toLowerCase();
+    if (this.status === 404) return "not_found";
+    if (this.status === 429) return "quota";
+    if (detail.includes("billing")) return "billing_required";
+    if (detail.includes("grounding") || detail.includes("tool") || detail.includes("not supported")) return "tool_not_available";
+    return "other";
+  }
 }
 
 interface GeminiPart {
@@ -105,6 +124,9 @@ async function callGemini(apiKey: string, model: string, body: Record<string, un
   return await response.json() as GeminiGenerateContentResponse;
 }
 
+export type ResearchMode = "GROUNDED" | "DEGRADED";
+export type GroundingStatus = "SUCCESS" | "UNAVAILABLE" | "FAILED";
+
 export interface ResearchResult {
   summary: string;
   sources: Array<{ url: string; title?: string }>;
@@ -112,22 +134,23 @@ export interface ResearchResult {
   usage: GeminiUsage;
   /** The actual model used for this call - for agent_runs observability. */
   model: string;
+  /**
+   * GROUNDED: Google Search grounding succeeded, summary/sources reflect
+   * real web research. DEGRADED: grounding was unavailable and a plain
+   * (ungrounded) generation was used instead - the caller must never treat
+   * a DEGRADED summary as verified web research (see buildDegradedResearchPrompt).
+   */
+  researchMode: ResearchMode;
+  groundingStatus: GroundingStatus;
+  /** Only set when groundingStatus !== "SUCCESS". */
+  groundingErrorSafe?: string;
 }
 
-/**
- * STEP A (Research Agent). Google Search grounding cannot be combined with
- * responseSchema/JSON mode in the same call, so this step returns free text
- * plus grounding sources; STEP B turns that into the structured preparation.
- * Uses the "research" stage model (must support Google Search grounding on
- * the free tier - see getGeminiCredentials' docstring).
- */
-export async function researchClinic(prompt: string): Promise<ResearchResult> {
-  const { apiKey, model } = getGeminiCredentials("research");
-  const data = await callGemini(apiKey, model, {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    tools: [{ google_search: {} }],
-  });
-
+function extractGrounded(data: GeminiGenerateContentResponse): {
+  summary: string;
+  sources: Array<{ url: string; title?: string }>;
+  searchCallCount: number;
+} {
   const candidate = data.candidates?.[0];
   const chunks = candidate?.groundingMetadata?.groundingChunks ?? [];
   const sources = chunks
@@ -139,9 +162,59 @@ export async function researchClinic(prompt: string): Promise<ResearchResult> {
     summary: textFrom(candidate),
     sources,
     searchCallCount: candidate?.groundingMetadata?.webSearchQueries?.length ?? (sources.length > 0 ? 1 : 0),
-    usage: usageFrom(data),
-    model,
   };
+}
+
+/**
+ * STEP A (Research Agent). Google Search grounding cannot be combined with
+ * responseSchema/JSON mode in the same call, so this step returns free text
+ * plus grounding sources; STEP B turns that into the structured preparation.
+ *
+ * Tries GROUNDED first (research-stage model + Google Search tool). If that
+ * fails for ANY reason, falls back to DEGRADED (generation-stage model,
+ * gemini-3.8-flash, no search tool, a prompt that explicitly forbids
+ * claiming web research was performed - see buildDegradedResearchPrompt).
+ * This is intentionally forward-compatible: once grounding becomes
+ * available (paid tier, or a future search provider), the GROUNDED path
+ * simply starts succeeding again with no code change needed here.
+ */
+export async function researchClinic(input: { groundedPrompt: string; degradedPrompt: string }): Promise<ResearchResult> {
+  const { apiKey: researchApiKey, model: researchModel } = getGeminiCredentials("research");
+
+  try {
+    const data = await callGemini(researchApiKey, researchModel, {
+      contents: [{ role: "user", parts: [{ text: input.groundedPrompt }] }],
+      tools: [{ google_search: {} }],
+    });
+
+    return {
+      ...extractGrounded(data),
+      usage: usageFrom(data),
+      model: researchModel,
+      researchMode: "GROUNDED",
+      groundingStatus: "SUCCESS",
+    };
+  } catch (error) {
+    const classification = error instanceof GeminiApiError ? error.classification : "other";
+    const groundingStatus: GroundingStatus = classification === "other" ? "FAILED" : "UNAVAILABLE";
+    const groundingErrorSafe = error instanceof Error ? error.message.slice(0, 200) : "unknown_error";
+
+    const { apiKey: fallbackApiKey, model: fallbackModel } = getGeminiCredentials("generation");
+    const data = await callGemini(fallbackApiKey, fallbackModel, {
+      contents: [{ role: "user", parts: [{ text: input.degradedPrompt }] }],
+    });
+
+    return {
+      summary: textFrom(data.candidates?.[0]),
+      sources: [],
+      searchCallCount: 0,
+      usage: usageFrom(data),
+      model: fallbackModel,
+      researchMode: "DEGRADED",
+      groundingStatus,
+      groundingErrorSafe,
+    };
+  }
 }
 
 export interface StructuredGenerationResult {

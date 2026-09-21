@@ -7,7 +7,7 @@ import { estimateCostUsd } from "@/lib/gemini/pricing";
 import { loadMedicalFsE1Skill } from "@/lib/skills/loader";
 import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility";
 import { loadAutoPreparationFlag } from "@/lib/preparation/feature-flags";
-import { buildAutoPreparationPrompt, buildResearchPrompt } from "@/lib/preparation/auto-prompt";
+import { buildAutoPreparationPrompt, buildDegradedResearchPrompt, buildResearchPrompt } from "@/lib/preparation/auto-prompt";
 import { extractJsonObject } from "@/lib/preparation/extract-json";
 import { PreparationResultSchema, type PreparationResult } from "@/lib/preparation/schema";
 import { enqueueMaterialGenerationJob } from "@/lib/jobs/queue";
@@ -120,15 +120,23 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
   let preparationRun: { id: string } | null = null;
 
   try {
-    const research = await researchClinic(buildResearchPrompt({
+    const researchPromptInput = {
       clinicName: event.title,
       calendarTitle: event.title,
       scheduledStartAt: meeting.scheduled_start_at,
-    }));
+    };
+    const research = await researchClinic({
+      groundedPrompt: buildResearchPrompt(researchPromptInput),
+      degradedPrompt: buildDegradedResearchPrompt(researchPromptInput),
+    });
 
     if (researchRun) {
+      // model is re-asserted here (not just at insert time) because a
+      // DEGRADED fallback uses a different model (generation-stage) than
+      // the research-stage model the row was originally created with.
       await admin.from("agent_runs").update({
         status: "DONE",
+        model: research.model,
         input_tokens: research.usage.inputTokens,
         output_tokens: research.usage.outputTokens,
         search_call_count: research.searchCallCount,
@@ -188,6 +196,10 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
         source_mode: "API",
         research_summary: research.summary,
         research_sources: research.sources,
+        research_mode: research.researchMode,
+        grounding_status: research.groundingStatus,
+        research_model: research.model,
+        grounding_error_safe: research.groundingErrorSafe ?? null,
         facts: preparation.facts,
         hypotheses: preparation.hypotheses,
         needs_confirmation: preparation.needs_confirmation,
