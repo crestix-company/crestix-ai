@@ -142,8 +142,17 @@ export async function GET() {
     ? await smokeTestGenerate(apiKey, "gemini-3.8-flash", false)
     : null;
 
-  const groundingSmokeTest = presentCandidates.includes("gemini-2.5-flash-lite")
-    ? await smokeTestGenerate(apiKey, "gemini-2.5-flash-lite", true)
+  // gemini-2.5-flash-lite is listed by models.list but returns 404 on
+  // generateContent ("no longer available to new users"); Google's own
+  // error message names models/gemini-3.5-flash-lite as the migration
+  // target, so test grounding against that instead once confirmed present.
+  const groundingCandidate = presentCandidates.includes("gemini-3.5-flash-lite")
+    ? "gemini-3.5-flash-lite"
+    : presentCandidates.includes("gemini-2.5-flash-lite")
+      ? "gemini-2.5-flash-lite"
+      : null;
+  const groundingSmokeTest = groundingCandidate
+    ? await smokeTestGenerate(apiKey, groundingCandidate, true)
     : null;
 
   return NextResponse.json({
