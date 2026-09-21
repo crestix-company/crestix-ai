@@ -121,7 +121,7 @@ describe("processCalendarJob - MEETING_PREPARATION", () => {
     const result = await processCalendarJob("job-1", "https://example.test");
 
     expect(result).toBe("done");
-    expect(runAutoPreparationForMeeting).toHaveBeenCalledWith("meeting-1");
+    expect(runAutoPreparationForMeeting).toHaveBeenCalledWith("meeting-1", 1);
     expect(syncGoogleCalendarConnection).not.toHaveBeenCalled();
     expect(ensureCalendarWatch).not.toHaveBeenCalled();
   });
@@ -141,6 +141,27 @@ describe("processCalendarJob - MEETING_PREPARATION", () => {
     expect(finalUpdate.status).toBe("PENDING");
     expect(finalUpdate.last_error_safe).toBe("gemini_timeout");
     expect(syncGoogleCalendarConnection).not.toHaveBeenCalled();
+  });
+
+  it("retries with jittered exponential backoff - run_after lands within [base/2, base] minutes, never a fixed exact value", async () => {
+    vi.mocked(runAutoPreparationForMeeting).mockRejectedValueOnce(new Error("gemini_503_high_demand"));
+    const { client, calls } = makeAdminMock({
+      // attempts=2 -> nextAttempts=3, base delay = 2**3 = 8 minutes
+      "jobs:select": [{ data: { id: "job-1", job_type: "MEETING_PREPARATION", google_connection_id: null, meeting_id: "meeting-1", status: "PENDING", attempts: 2, run_after: new Date(0).toISOString() } }],
+      "jobs:update": [{ data: { id: "job-1" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    const before = Date.now();
+    const result = await processCalendarJob("job-1", "https://example.test");
+    const after = Date.now();
+
+    expect(result).toBe("retry");
+    const finalUpdate = calls.jobs[calls.jobs.length - 1] as Record<string, unknown>;
+    const runAfterMs = new Date(finalUpdate.run_after as string).getTime();
+    const baseDelayMs = 8 * 60_000;
+    expect(runAfterMs).toBeGreaterThanOrEqual(before + baseDelayMs / 2);
+    expect(runAfterMs).toBeLessThanOrEqual(after + baseDelayMs);
   });
 
   it("flips meeting_preparations and meetings to FAILED only once max attempts are exhausted", async () => {
@@ -272,7 +293,7 @@ describe("processCalendarJob - MATERIAL_GENERATION", () => {
     const result = await processCalendarJob("job-4", "https://example.test");
 
     expect(result).toBe("done");
-    expect(runMaterialGenerationForMeeting).toHaveBeenCalledWith("meeting-1");
+    expect(runMaterialGenerationForMeeting).toHaveBeenCalledWith("meeting-1", 1);
   });
 
   it("on final failure, marks only meeting_materials FAILED - never meeting_preparations or meetings", async () => {

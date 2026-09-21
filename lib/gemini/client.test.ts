@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getGeminiCredentials } from "@/lib/security/server-secrets";
 import { generateStructuredJson, researchClinic } from "./client";
 
 vi.mock("@/lib/security/server-secrets", () => ({
-  getGeminiCredentials: (stage: "research" | "generation") => (
+  getGeminiCredentials: vi.fn((stage: "research" | "generation") => (
     stage === "research"
       ? { apiKey: "test-key", model: "gemini-research-model" }
       : { apiKey: "test-key", model: "gemini-generation-model" }
-  ),
+  )),
 }));
 
 const originalFetch = global.fetch;
@@ -102,6 +103,20 @@ describe("researchClinic", () => {
     expect(result.groundingErrorSafe).toContain("429");
   });
 
+  it("threads the caller-supplied attempts count into the generation-stage credential lookup for the DEGRADED fallback (enables model fallback after repeated failures)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 429, text: async () => "" })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ candidates: [{ content: { parts: [{ text: "degraded" }] } }], usageMetadata: {} }),
+      });
+    global.fetch = fetchMock as never;
+
+    await researchClinic({ groundedPrompt: "g", degradedPrompt: "d", attempts: 4 });
+
+    expect(getGeminiCredentials).toHaveBeenCalledWith("generation", { attempts: 4 });
+  });
+
   it("classifies an unexpected (non-quota/config) grounding failure as FAILED rather than UNAVAILABLE, while still degrading gracefully", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false, status: 500, text: async () => "internal error" })
@@ -155,5 +170,16 @@ describe("generateStructuredJson", () => {
     expect(body.tools).toBeUndefined();
     expect(result.rawText).toBe("{\"ok\":true}");
     expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 7 });
+  });
+
+  it("threads the caller-supplied attempts count into the generation-stage credential lookup", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ candidates: [{ content: { parts: [{ text: "{}" }] } }], usageMetadata: {} }),
+    }) as never;
+
+    await generateStructuredJson("prompt", { attempts: 6 });
+
+    expect(getGeminiCredentials).toHaveBeenCalledWith("generation", { attempts: 6 });
   });
 });

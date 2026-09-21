@@ -2,7 +2,7 @@ import "server-only";
 
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getGeminiCredentials } from "@/lib/security/server-secrets";
-import { generateStructuredJson, researchClinic } from "@/lib/gemini/client";
+import { generateStructuredJson, researchClinic, type GroundingStatus, type ResearchMode, type ResearchResult } from "@/lib/gemini/client";
 import { estimateCostUsd } from "@/lib/gemini/pricing";
 import { loadMedicalFsE1Skill } from "@/lib/skills/loader";
 import { isEligibleForAutoPreparation } from "@/lib/preparation/auto-eligibility";
@@ -26,11 +26,33 @@ interface MeetingRow {
 interface CalendarEventRow {
   title: string;
   description: string | null;
+  source_updated_at: string | null;
+}
+
+interface ResearchCheckpointRow {
+  research_status: string | null;
+  research_summary: string | null;
+  research_sources: unknown;
+  research_mode: string | null;
+  grounding_status: string | null;
+  research_model: string | null;
+  grounding_error_safe: string | null;
+  research_source_updated_at: string | null;
+  attempt_count: number | null;
 }
 
 function safeErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message.slice(0, 200);
   return "unknown_error";
+}
+
+/** Both null (event has never carried a Google-side updated_at) counts as a match. */
+function sameEventVersion(a: string | null | undefined, b: string | null | undefined): boolean {
+  const aValue = a ?? null;
+  const bValue = b ?? null;
+  if (aValue === null && bValue === null) return true;
+  if (aValue === null || bValue === null) return false;
+  return new Date(aValue).getTime() === new Date(bValue).getTime();
 }
 
 async function loadMeetingContext(meetingId: string): Promise<{ meeting: MeetingRow; event: CalendarEventRow }> {
@@ -45,7 +67,7 @@ async function loadMeetingContext(meetingId: string): Promise<{ meeting: Meeting
 
   const { data: event, error: eventError } = await admin
     .from("calendar_events")
-    .select("title,description")
+    .select("title,description,source_updated_at")
     .eq("id", meeting.calendar_event_id)
     .maybeSingle();
   if (eventError || !event) throw new Error("meeting_preparation_calendar_event_missing");
@@ -72,11 +94,24 @@ function parsePreparation(rawText: string): PreparationResult {
  * an already-READY Preparation, and never re-runs (re-bills) Research or
  * Preparation on retry.
  *
+ * Research is stage-checkpointed: as soon as it succeeds, its result is
+ * persisted to meeting_preparations (research_status=READY) *before*
+ * Preparation is attempted, independent of the row's overall `status`. A
+ * retry (e.g. after a transient Preparation-stage failure) reuses that
+ * checkpoint instead of re-running - and re-billing - Research, as long as
+ * the underlying Calendar event hasn't changed since (research_source_
+ * updated_at pinned to calendar_events.source_updated_at).
+ *
+ * jobAttempts (the job's post-claim attempt count) is threaded down into
+ * the generation-stage Gemini calls so a persistently-failing run can fall
+ * back to an alternate model after enough attempts (see
+ * getGeminiCredentials's GENERATION_FALLBACK_AFTER_ATTEMPTS).
+ *
  * Re-checks eligibility itself (feature flag / meeting type / cancellation /
  * automation_start_at) rather than trusting the enqueue-time check, since
  * time may have passed between enqueue and a retried run.
  */
-export async function runAutoPreparationForMeeting(meetingId: string): Promise<void> {
+export async function runAutoPreparationForMeeting(meetingId: string, jobAttempts = 0): Promise<void> {
   const { meeting, event } = await loadMeetingContext(meetingId);
 
   const flag = await loadAutoPreparationFlag(meeting.fs_user_id);
@@ -90,6 +125,13 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
 
   const admin = createAdminClient();
 
+  const { data: checkpoint } = await admin
+    .from("meeting_preparations")
+    .select("research_status,research_summary,research_sources,research_mode,grounding_status,research_model,grounding_error_safe,research_source_updated_at,attempt_count")
+    .eq("meeting_id", meetingId)
+    .maybeSingle();
+  const checkpointRow = checkpoint as ResearchCheckpointRow | null;
+
   await admin.from("meetings").update({ status: "PREPARING" }).eq("id", meetingId).neq("status", "CANCELLED");
   await admin.from("meeting_preparations").upsert({
     meeting_id: meetingId,
@@ -97,60 +139,121 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
     source_mode: "API",
   }, { onConflict: "meeting_id" });
 
-  // Resolved up front only to populate the agent_runs row before the call
-  // completes - researchClinic/generateStructuredJson resolve the same
-  // (deterministic, env-based) credentials internally for the actual call.
-  const { model: researchModel } = getGeminiCredentials("research");
+  const canReuseResearch = Boolean(
+    checkpointRow?.research_status === "READY"
+    && checkpointRow.research_summary !== null
+    && sameEventVersion(checkpointRow.research_source_updated_at, event.source_updated_at),
+  );
 
-  const { data: researchRun } = await admin
-    .from("agent_runs")
-    .insert({
-      meeting_id: meetingId,
-      initiated_by_user_id: meeting.fs_user_id,
-      mode: "RESEARCH",
-      provider: GEMINI_PROVIDER,
-      model: researchModel,
-      status: "RUNNING",
-      trigger_source: "GOOGLE_CALENDAR",
-      started_at: new Date().toISOString(),
-    })
-    .select("id")
-    .single();
+  let research: ResearchResult;
+  let researchRun: { id: string } | null = null;
+
+  if (canReuseResearch && checkpointRow) {
+    research = {
+      summary: checkpointRow.research_summary ?? "",
+      sources: (checkpointRow.research_sources ?? []) as ResearchResult["sources"],
+      searchCallCount: 0,
+      usage: { inputTokens: null, outputTokens: null },
+      model: checkpointRow.research_model ?? "",
+      researchMode: (checkpointRow.research_mode as ResearchMode) ?? "DEGRADED",
+      groundingStatus: (checkpointRow.grounding_status as GroundingStatus) ?? "FAILED",
+      groundingErrorSafe: checkpointRow.grounding_error_safe ?? undefined,
+    };
+  } else {
+    // Resolved up front only to populate the agent_runs row before the call
+    // completes - researchClinic resolves the same (deterministic, env-based)
+    // credentials internally for the actual call.
+    const { model: researchModel } = getGeminiCredentials("research");
+
+    const { data: insertedResearchRun } = await admin
+      .from("agent_runs")
+      .insert({
+        meeting_id: meetingId,
+        initiated_by_user_id: meeting.fs_user_id,
+        mode: "RESEARCH",
+        provider: GEMINI_PROVIDER,
+        model: researchModel,
+        status: "RUNNING",
+        trigger_source: "GOOGLE_CALENDAR",
+        started_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+    researchRun = insertedResearchRun;
+
+    try {
+      const researchPromptInput = {
+        clinicName: event.title,
+        calendarTitle: event.title,
+        scheduledStartAt: meeting.scheduled_start_at,
+      };
+      research = await researchClinic({
+        groundedPrompt: buildResearchPrompt(researchPromptInput),
+        degradedPrompt: buildDegradedResearchPrompt(researchPromptInput),
+        attempts: jobAttempts,
+      });
+
+      if (researchRun) {
+        // model is re-asserted here (not just at insert time) because a
+        // DEGRADED fallback uses a different model (generation-stage) than
+        // the research-stage model the row was originally created with.
+        await admin.from("agent_runs").update({
+          status: "DONE",
+          model: research.model,
+          input_tokens: research.usage.inputTokens,
+          output_tokens: research.usage.outputTokens,
+          search_call_count: research.searchCallCount,
+          estimated_cost_usd: estimateCostUsd({
+            inputTokens: research.usage.inputTokens,
+            outputTokens: research.usage.outputTokens,
+            searchCallCount: research.searchCallCount,
+          }),
+          completed_at: new Date().toISOString(),
+        }).eq("id", researchRun.id);
+      }
+
+      // Checkpoint immediately, before Preparation is even attempted: a
+      // later Preparation-stage failure must not cost this successful
+      // Research.
+      await admin.from("meeting_preparations").upsert({
+        meeting_id: meetingId,
+        status: "PREPARING",
+        source_mode: "API",
+        research_status: "READY",
+        research_summary: research.summary,
+        research_sources: research.sources,
+        research_mode: research.researchMode,
+        grounding_status: research.groundingStatus,
+        research_model: research.model,
+        grounding_error_safe: research.groundingErrorSafe ?? null,
+        research_generated_at: new Date().toISOString(),
+        research_source_updated_at: event.source_updated_at,
+      }, { onConflict: "meeting_id" });
+    } catch (error) {
+      if (researchRun) {
+        await admin.from("agent_runs").update({
+          status: "FAILED",
+          error_safe: safeErrorMessage(error),
+          completed_at: new Date().toISOString(),
+        }).eq("id", researchRun.id);
+      }
+      try {
+        await admin.from("meeting_preparations").update({ research_status: "FAILED" }).eq("meeting_id", meetingId);
+      } catch (checkpointError) {
+        console.error("research_checkpoint_failure_flag_failed", {
+          meeting_id: meetingId,
+          code: safeErrorMessage(checkpointError),
+        });
+      }
+      throw error;
+    }
+  }
 
   let preparationRun: { id: string } | null = null;
 
   try {
-    const researchPromptInput = {
-      clinicName: event.title,
-      calendarTitle: event.title,
-      scheduledStartAt: meeting.scheduled_start_at,
-    };
-    const research = await researchClinic({
-      groundedPrompt: buildResearchPrompt(researchPromptInput),
-      degradedPrompt: buildDegradedResearchPrompt(researchPromptInput),
-    });
-
-    if (researchRun) {
-      // model is re-asserted here (not just at insert time) because a
-      // DEGRADED fallback uses a different model (generation-stage) than
-      // the research-stage model the row was originally created with.
-      await admin.from("agent_runs").update({
-        status: "DONE",
-        model: research.model,
-        input_tokens: research.usage.inputTokens,
-        output_tokens: research.usage.outputTokens,
-        search_call_count: research.searchCallCount,
-        estimated_cost_usd: estimateCostUsd({
-          inputTokens: research.usage.inputTokens,
-          outputTokens: research.usage.outputTokens,
-          searchCallCount: research.searchCallCount,
-        }),
-        completed_at: new Date().toISOString(),
-      }).eq("id", researchRun.id);
-    }
-
     const skill = await loadMedicalFsE1Skill();
-    const { model: generationModel } = getGeminiCredentials("generation");
+    const { model: generationModel } = getGeminiCredentials("generation", { attempts: jobAttempts });
 
     const { data: insertedPreparationRun } = await admin
       .from("agent_runs")
@@ -177,7 +280,7 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
       includePrivateNotes: flag.config.includePrivateCalendarNotes,
       research,
       skillContent: skill.content,
-    }));
+    }), { attempts: jobAttempts });
 
     const preparation = parsePreparation(generation.rawText);
 
@@ -194,12 +297,14 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
         skill_version_id: skill.skillVersionId,
         status: "READY",
         source_mode: "API",
+        research_status: "READY",
         research_summary: research.summary,
         research_sources: research.sources,
         research_mode: research.researchMode,
         grounding_status: research.groundingStatus,
         research_model: research.model,
         grounding_error_safe: research.groundingErrorSafe ?? null,
+        research_source_updated_at: event.source_updated_at,
         facts: preparation.facts,
         hypotheses: preparation.hypotheses,
         needs_confirmation: preparation.needs_confirmation,
@@ -266,18 +371,16 @@ export async function runAutoPreparationForMeeting(meetingId: string): Promise<v
       }
     }
   } catch (error) {
+    // Research (fresh or reused) has already fully succeeded and been
+    // checkpointed by the time this try block starts - any failure past
+    // this point is a Preparation-stage-only failure and must never touch
+    // the already-DONE RESEARCH agent_runs row or its checkpoint.
     if (preparationRun) {
       await admin.from("agent_runs").update({
         status: "FAILED",
         error_safe: safeErrorMessage(error),
         completed_at: new Date().toISOString(),
       }).eq("id", preparationRun.id);
-    } else if (researchRun) {
-      await admin.from("agent_runs").update({
-        status: "FAILED",
-        error_safe: safeErrorMessage(error),
-        completed_at: new Date().toISOString(),
-      }).eq("id", researchRun.id);
     }
     throw error;
   }

@@ -178,7 +178,7 @@ function extractGrounded(data: GeminiGenerateContentResponse): {
  * available (paid tier, or a future search provider), the GROUNDED path
  * simply starts succeeding again with no code change needed here.
  */
-export async function researchClinic(input: { groundedPrompt: string; degradedPrompt: string }): Promise<ResearchResult> {
+export async function researchClinic(input: { groundedPrompt: string; degradedPrompt: string; attempts?: number }): Promise<ResearchResult> {
   const { apiKey: researchApiKey, model: researchModel } = getGeminiCredentials("research");
 
   try {
@@ -199,7 +199,7 @@ export async function researchClinic(input: { groundedPrompt: string; degradedPr
     const groundingStatus: GroundingStatus = classification === "other" ? "FAILED" : "UNAVAILABLE";
     const groundingErrorSafe = error instanceof Error ? error.message.slice(0, 200) : "unknown_error";
 
-    const { apiKey: fallbackApiKey, model: fallbackModel } = getGeminiCredentials("generation");
+    const { apiKey: fallbackApiKey, model: fallbackModel } = getGeminiCredentials("generation", { attempts: input.attempts });
     const data = await callGemini(fallbackApiKey, fallbackModel, {
       contents: [{ role: "user", parts: [{ text: input.degradedPrompt }] }],
     });
@@ -230,8 +230,8 @@ export interface StructuredGenerationResult {
  * neither needs Google Search grounding, so the current GA stable model
  * can be used for output quality rather than the grounding-capable one).
  */
-export async function generateStructuredJson(prompt: string): Promise<StructuredGenerationResult> {
-  const { apiKey, model } = getGeminiCredentials("generation");
+export async function generateStructuredJson(prompt: string, options?: { attempts?: number }): Promise<StructuredGenerationResult> {
+  const { apiKey, model } = getGeminiCredentials("generation", { attempts: options?.attempts });
   const data = await callGemini(apiKey, model, {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: { responseMimeType: "application/json" },

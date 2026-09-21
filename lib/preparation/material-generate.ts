@@ -23,8 +23,13 @@ function safeErrorMessage(error: unknown): string {
  * Preparation, and must never revert an already-READY Preparation. Re-checks
  * cancellation/preparation-readiness itself, since time may have passed
  * between enqueue and a retried run.
+ *
+ * jobAttempts (the job's post-claim attempt count) is threaded into the
+ * generation-stage Gemini call so a persistently-failing run can fall back
+ * to an alternate model after enough attempts (see getGeminiCredentials's
+ * GENERATION_FALLBACK_AFTER_ATTEMPTS).
  */
-export async function runMaterialGenerationForMeeting(meetingId: string): Promise<void> {
+export async function runMaterialGenerationForMeeting(meetingId: string, jobAttempts = 0): Promise<void> {
   const admin = createAdminClient();
 
   const { data: meeting, error: meetingError } = await admin
@@ -74,7 +79,7 @@ export async function runMaterialGenerationForMeeting(meetingId: string): Promis
     sources: preparationRow.sources,
   } satisfies Partial<PreparationResult> as PreparationResult);
 
-  const { model } = getGeminiCredentials("generation");
+  const { model } = getGeminiCredentials("generation", { attempts: jobAttempts });
   const startedAt = new Date().toISOString();
 
   const { data: agentRun } = await admin
@@ -102,7 +107,7 @@ export async function runMaterialGenerationForMeeting(meetingId: string): Promis
     const generation = await generateStructuredJson(buildMaterialPrompt({
       clinicName: event.title,
       preparationJson: JSON.stringify(preparation),
-    }));
+    }), { attempts: jobAttempts });
 
     const parsedJson = extractJsonObject(generation.rawText);
     if (parsedJson === null) throw new Error("gemini_material_response_not_json");

@@ -40,7 +40,7 @@ const meetingRow = {
   calendar_event_id: "event-1",
 };
 
-const eventRow = { title: "【お打ち合わせ①】テストクリニック 様", description: null };
+const eventRow = { title: "【お打ち合わせ①】テストクリニック 様", description: null, source_updated_at: "2026-09-19T00:00:00.000Z" };
 
 const validPreparationJson = JSON.stringify({
   facts: [{ statement: "自費診療あり", source_url: "https://example.com/clinic" }],
@@ -137,7 +137,10 @@ describe("runAutoPreparationForMeeting", () => {
 
     await runAutoPreparationForMeeting("meeting-1");
 
-    const finalPrep = calls["meeting_preparations:upsert"][1] as Record<string, unknown>;
+    // upsert[0] = initial PREPARING; upsert[1] = Research-stage checkpoint
+    // (research_status READY, overall status still PREPARING); upsert[2] =
+    // final READY save once Preparation also succeeds.
+    const finalPrep = calls["meeting_preparations:upsert"][2] as Record<string, unknown>;
     expect(finalPrep.status).toBe("READY");
     expect(finalPrep.source_mode).toBe("API");
     expect(finalPrep.attempt_count).toBe(1);
@@ -208,6 +211,122 @@ describe("runAutoPreparationForMeeting", () => {
     expect(agentRunUpdates[1].status).toBe("FAILED");
     expect(calls["meeting_materials:upsert"]).toBeUndefined();
     expect(calls["jobs:upsert"]).toBeUndefined();
+  });
+
+  it("reuses a READY Research checkpoint (same event version) instead of re-running Research, when Preparation is retried", async () => {
+    vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
+    vi.mocked(generateStructuredJson).mockResolvedValueOnce({
+      rawText: validPreparationJson, usage: { inputTokens: 30, outputTokens: 40 }, model: "gemini-3.8-flash",
+    });
+
+    const checkpointRow = {
+      research_status: "READY",
+      research_summary: "以前成功したResearchの結果",
+      research_sources: [{ url: "https://example.com/clinic" }],
+      research_mode: "GROUNDED",
+      grounding_status: "SUCCESS",
+      research_model: "gemini-3.5-flash-lite",
+      grounding_error_safe: null,
+      research_source_updated_at: eventRow.source_updated_at,
+      attempt_count: 1,
+    };
+
+    const { client, calls } = makeAdminMock({
+      "meetings:select": [{ data: meetingRow, error: null }],
+      "calendar_events:select": [{ data: eventRow, error: null }],
+      "agent_runs:insert": [{ data: { id: "agent-run-preparation" }, error: null }],
+      "meeting_preparations:select": [{ data: checkpointRow, error: null }],
+      "meeting_preparations:upsert": [{ data: null, error: null }, { data: { id: "prep-1" }, error: null }],
+      "jobs:upsert": [{ data: { id: "material-job-1" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await runAutoPreparationForMeeting("meeting-1", 3);
+
+    expect(researchClinic).not.toHaveBeenCalled();
+    expect(generateStructuredJson).toHaveBeenCalledTimes(1);
+
+    // Only one agent_runs row is ever inserted this run: PREPARATION. No
+    // fresh RESEARCH row, since the checkpoint was reused.
+    const agentRunInserts = calls["agent_runs:insert"] as Array<Record<string, unknown>>;
+    expect(agentRunInserts).toHaveLength(1);
+    expect(agentRunInserts[0].mode).toBe("PREPARATION");
+
+    const finalPrep = calls["meeting_preparations:upsert"][1] as Record<string, unknown>;
+    expect(finalPrep.status).toBe("READY");
+    expect(finalPrep.research_summary).toBe(checkpointRow.research_summary);
+    expect(finalPrep.research_mode).toBe("GROUNDED");
+  });
+
+  it("does not reuse a Research checkpoint once the underlying Calendar event has been edited since (source_updated_at mismatch)", async () => {
+    vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
+    vi.mocked(researchClinic).mockResolvedValue({
+      summary: "新しいResearch結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.5-flash-lite",
+      researchMode: "GROUNDED", groundingStatus: "SUCCESS",
+    });
+    vi.mocked(generateStructuredJson).mockResolvedValueOnce({
+      rawText: validPreparationJson, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.8-flash",
+    });
+
+    const staleCheckpointRow = {
+      research_status: "READY",
+      research_summary: "編集前のイベントに対するResearch結果",
+      research_sources: [],
+      research_mode: "GROUNDED",
+      grounding_status: "SUCCESS",
+      research_model: "gemini-3.5-flash-lite",
+      grounding_error_safe: null,
+      research_source_updated_at: "2026-09-18T00:00:00.000Z", // older than eventRow's
+      attempt_count: 1,
+    };
+
+    const { client, calls } = makeAdminMock({
+      "meetings:select": [{ data: meetingRow, error: null }],
+      "calendar_events:select": [{ data: eventRow, error: null }],
+      "agent_runs:insert": [{ data: { id: "agent-run-1" }, error: null }],
+      "meeting_preparations:select": [{ data: staleCheckpointRow, error: null }],
+      "meeting_preparations:upsert": [{ data: null, error: null }, { data: { id: "prep-1" }, error: null }],
+      "jobs:upsert": [{ data: { id: "material-job-1" }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await runAutoPreparationForMeeting("meeting-1");
+
+    expect(researchClinic).toHaveBeenCalledTimes(1);
+    const agentRunInserts = calls["agent_runs:insert"] as Array<Record<string, unknown>>;
+    expect(agentRunInserts.map((row) => row.mode)).toEqual(["RESEARCH", "PREPARATION"]);
+  });
+
+  it("a Preparation failure after a FRESH Research success never re-marks the already-DONE RESEARCH agent run, and leaves the checkpoint intact for the next retry to reuse", async () => {
+    vi.mocked(loadAutoPreparationFlag).mockResolvedValue(enabledFlag);
+    vi.mocked(researchClinic).mockResolvedValue({
+      summary: "調査結果", sources: [], searchCallCount: 0, usage: { inputTokens: 1, outputTokens: 1 }, model: "gemini-3.5-flash-lite",
+      researchMode: "GROUNDED", groundingStatus: "SUCCESS",
+    });
+    vi.mocked(generateStructuredJson).mockRejectedValueOnce(new Error("gemini_503_high_demand"));
+
+    const { client, calls } = makeAdminMock({
+      "meetings:select": [{ data: meetingRow, error: null }],
+      "calendar_events:select": [{ data: eventRow, error: null }],
+      "agent_runs:insert": [{ data: { id: "agent-run-research" } }, { data: { id: "agent-run-preparation" } }],
+      "meeting_preparations:select": [{ data: { attempt_count: 0 }, error: null }],
+    });
+    vi.mocked(createAdminClient).mockReturnValue(client as never);
+
+    await expect(runAutoPreparationForMeeting("meeting-1")).rejects.toThrow("gemini_503_high_demand");
+
+    // Only the PREPARATION agent run is ever marked FAILED - the RESEARCH
+    // run (already checkpointed DONE before Preparation was attempted) must
+    // never be touched again by this failure.
+    const agentRunUpdates = calls["agent_runs:update"] as Array<Record<string, unknown>>;
+    expect(agentRunUpdates).toHaveLength(2);
+    expect(agentRunUpdates[0].status).toBe("DONE"); // RESEARCH
+    expect(agentRunUpdates[1].status).toBe("FAILED"); // PREPARATION only
+
+    // The checkpoint upsert (research_status READY) happened before
+    // Preparation was attempted at all.
+    const checkpointUpsert = calls["meeting_preparations:upsert"][1] as Record<string, unknown>;
+    expect(checkpointUpsert.research_status).toBe("READY");
   });
 
   it("re-throws and marks the RESEARCH agent run FAILED when research itself fails", async () => {

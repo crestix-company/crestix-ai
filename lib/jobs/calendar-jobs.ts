@@ -181,10 +181,10 @@ export async function processCalendarJob(
       await ensureCalendarWatch(pending.google_connection_id, appOrigin, { force: true });
     } else if (pending.job_type === "MEETING_PREPARATION") {
       if (!pending.meeting_id) throw new Error("meeting_preparation_job_meeting_missing");
-      await runAutoPreparationForMeeting(pending.meeting_id);
+      await runAutoPreparationForMeeting(pending.meeting_id, nextAttempts);
     } else if (pending.job_type === "MATERIAL_GENERATION") {
       if (!pending.meeting_id) throw new Error("material_generation_job_meeting_missing");
-      await runMaterialGenerationForMeeting(pending.meeting_id);
+      await runMaterialGenerationForMeeting(pending.meeting_id, nextAttempts);
     } else {
       throw new Error("unsupported_job_type");
     }
@@ -225,14 +225,19 @@ export async function processCalendarJob(
       return "failed";
     }
 
-    const delayMinutes = Math.min(60, 2 ** nextAttempts);
+    // Equal jitter (half fixed + half random): spreads out retries enough
+    // to avoid every job in a batch re-hitting a transient upstream outage
+    // (e.g. Gemini 503 "high demand") at the exact same instant, while
+    // still guaranteeing at least half of the base exponential delay.
+    const baseDelayMinutes = Math.min(60, 2 ** nextAttempts);
+    const jitteredDelayMinutes = baseDelayMinutes / 2 + Math.random() * (baseDelayMinutes / 2);
     await admin
       .from("jobs")
       .update({
         status: "PENDING",
         locked_at: null,
         last_error_safe: safeError,
-        run_after: new Date(Date.now() + delayMinutes * 60_000).toISOString(),
+        run_after: new Date(Date.now() + jitteredDelayMinutes * 60_000).toISOString(),
       })
       .eq("id", jobId);
 
